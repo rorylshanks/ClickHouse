@@ -39,6 +39,8 @@
 #include <Processors/Formats/Impl/ParquetV3BlockInputFormat.h>
 
 #include <boost/algorithm/string/case_conv.hpp>
+#include <MurmurHash3.h>
+#include <unordered_set>
 
 namespace ProfileEvents
 {
@@ -79,6 +81,39 @@ String removeListElement(const String & value)
     while ((pos = result.find(pattern)) != std::string::npos)
         result.erase(pos, pattern.size());
     return result;
+}
+
+constexpr std::string_view JSON_MATERIALIZED_BUCKET_MARKER = "__json_type_bucket_";
+
+bool tryExtractJsonBaseFromSubcolumn(std::string_view name, String & base, String & path)
+{
+    auto dot_pos = name.find('.');
+    if (dot_pos == std::string_view::npos || dot_pos == 0 || dot_pos + 1 >= name.size())
+        return false;
+    base.assign(name.substr(0, dot_pos));
+    path.assign(name.substr(dot_pos + 1));
+    return true;
+}
+
+bool tryExtractJsonBaseFromBucket(std::string_view name, String & base)
+{
+    auto marker_pos = name.find(JSON_MATERIALIZED_BUCKET_MARKER);
+    if (marker_pos == std::string_view::npos || marker_pos == 0)
+        return false;
+    base.assign(name.substr(0, marker_pos));
+    return true;
+}
+
+UInt8 jsonMaterializedBucketForPath(std::string_view path)
+{
+    HashState out{};
+    MurmurHash3_x64_128(path.data(), path.size(), 0, out);
+    return static_cast<UInt8>(out.h1 & 0xFF);
+}
+
+String jsonMaterializedBucketColumnName(std::string_view base, std::string_view path)
+{
+    return String(base) + String(JSON_MATERIALIZED_BUCKET_MARKER) + std::to_string(jsonMaterializedBucketForPath(path));
 }
 
 
@@ -726,11 +761,145 @@ void ParquetBlockInputFormat::initializeIfNeeded()
     }
     auto index_mapping = field_util.findRequiredIndices(getPort().getHeader(), *schema, *metadata, clickhouse_names_to_parquet);
 
+    std::unordered_set<int> column_indices_set;
+    column_indices_set.reserve(index_mapping.size() * 2);
+
     for (const auto & [clickhouse_header_index, parquet_indexes] : index_mapping)
     {
         for (auto parquet_index : parquet_indexes)
         {
-            column_indices.push_back(parquet_index);
+            if (column_indices_set.insert(parquet_index).second)
+                column_indices.push_back(parquet_index);
+        }
+    }
+
+    if (format_settings.parquet.enable_materialized_json_subcolumns)
+    {
+        /// Use calculateFieldIndices to get the proper Parquet column indices for each field.
+        /// For MAP columns, this returns (start_index, count) where count=2 (keys + values).
+        auto field_indices = field_util.calculateFieldIndices(*schema);
+
+        std::unordered_set<String> direct_columns;
+        std::unordered_set<String> derived_bases;
+        direct_columns.reserve(schema->num_fields());
+        derived_bases.reserve(schema->num_fields());
+
+        for (int i = 0; i < schema->num_fields(); ++i)
+        {
+            auto name = schema->field(i)->name();
+            String base;
+            String path;
+            if (tryExtractJsonBaseFromSubcolumn(name, base, path) || tryExtractJsonBaseFromBucket(name, base))
+            {
+                if (format_settings.parquet.case_insensitive_column_matching)
+                    boost::to_lower(base);
+                derived_bases.insert(base);
+            }
+            else
+            {
+                String name_lower = name;
+                if (format_settings.parquet.case_insensitive_column_matching)
+                    boost::to_lower(name_lower);
+                direct_columns.insert(name_lower);
+            }
+        }
+
+        std::unordered_set<String> json_materialized_bases;
+        std::unordered_set<int> json_base_indices;
+        json_materialized_bases.reserve(derived_bases.size());
+        for (const auto & base : derived_bases)
+        {
+            if (direct_columns.contains(base))
+            {
+                json_materialized_bases.insert(base);
+                /// Track all indices of the JSON base column - we NEVER want to read it
+                if (auto it = field_indices.find(base); it != field_indices.end())
+                {
+                    int start = it->second.first;
+                    int count = it->second.second;
+                    for (int i = 0; i < count; ++i)
+                        json_base_indices.insert(start + i);
+                }
+            }
+        }
+
+        /// Helper to add all parquet indices for a field (handles MAP columns with multiple indices)
+        auto add_field_indices = [&](const String & field_name) -> bool
+        {
+            auto it = field_indices.find(field_name);
+            if (it == field_indices.end())
+                return false;
+
+            int start = it->second.first;
+            int count = it->second.second;
+            for (int i = 0; i < count; ++i)
+            {
+                if (column_indices_set.insert(start + i).second)
+                    column_indices.push_back(start + i);
+            }
+            return true;
+        };
+
+        /// For header columns that look like JSON subcolumns, add the appropriate materialized column
+        for (const auto & header_column : getPort().getHeader().getNamesAndTypesList())
+        {
+            String json_base;
+            String json_path;
+            if (!tryExtractJsonBaseFromSubcolumn(header_column.name, json_base, json_path))
+                continue;
+
+            String json_base_norm = json_base;
+            String header_name_norm = header_column.name;
+            if (format_settings.parquet.case_insensitive_column_matching)
+            {
+                boost::to_lower(json_base_norm);
+                boost::to_lower(header_name_norm);
+            }
+
+            if (!json_materialized_bases.contains(json_base_norm))
+                continue;
+
+            /// Try direct column first
+            if (add_field_indices(header_name_norm))
+                continue;
+
+            /// Fall back to bucket column - count how many buckets exist and use modulo
+            size_t num_buckets = 0;
+            String bucket_prefix = json_base_norm + String(JSON_MATERIALIZED_BUCKET_MARKER);
+            for (const auto & [col_name, _] : field_indices)
+            {
+                if (col_name.starts_with(bucket_prefix))
+                    ++num_buckets;
+            }
+
+            String bucket_name;
+            if (num_buckets > 0)
+            {
+                UInt8 raw_bucket = jsonMaterializedBucketForPath(json_path);
+                UInt8 actual_bucket = raw_bucket % num_buckets;
+                bucket_name = json_base_norm + String(JSON_MATERIALIZED_BUCKET_MARKER) + std::to_string(actual_bucket);
+            }
+            else
+            {
+                bucket_name = jsonMaterializedBucketColumnName(json_base, json_path);
+                if (format_settings.parquet.case_insensitive_column_matching)
+                    boost::to_lower(bucket_name);
+            }
+
+            add_field_indices(bucket_name);
+        }
+
+        /// ALWAYS remove JSON base columns - we NEVER want to read/parse the full JSON
+        if (!json_base_indices.empty())
+        {
+            std::vector<int> new_column_indices;
+            new_column_indices.reserve(column_indices.size());
+            for (int idx : column_indices)
+            {
+                if (!json_base_indices.contains(idx))
+                    new_column_indices.push_back(idx);
+            }
+            column_indices = std::move(new_column_indices);
         }
     }
 
@@ -1415,7 +1584,7 @@ void registerInputFormatParquet(FormatFactory & factory)
         {
             size_t min_bytes_for_seek
                 = is_remote_fs ? read_settings.remote_read_min_bytes_for_seek : settings.parquet.local_read_min_bytes_for_seek;
-            if (settings.parquet.use_native_reader_v3)
+            if (settings.parquet.use_native_reader_v3 && !settings.parquet.enable_materialized_json_subcolumns)
             {
                 return std::make_shared<ParquetV3BlockInputFormat>(
                     buf,
@@ -1453,7 +1622,7 @@ void registerParquetSchemaReader(FormatFactory & factory)
         "Parquet",
         [](ReadBuffer & buf, const FormatSettings & settings) -> SchemaReaderPtr
         {
-            if (settings.parquet.use_native_reader_v3)
+            if (settings.parquet.use_native_reader_v3 && !settings.parquet.enable_materialized_json_subcolumns)
                 return std::make_shared<NativeParquetSchemaReader>(buf, settings);
             else
                 return std::make_shared<ArrowParquetSchemaReader>(buf, settings);
@@ -1465,9 +1634,10 @@ void registerParquetSchemaReader(FormatFactory & factory)
         [](const FormatSettings & settings)
         {
             return fmt::format(
-                "schema_inference_make_columns_nullable={};enable_json_parsing={};use_native_reader_v3={}",
+                "schema_inference_make_columns_nullable={};enable_json_parsing={};enable_materialized_json_subcolumns={};use_native_reader_v3={}",
                 settings.schema_inference_make_columns_nullable,
                 settings.parquet.enable_json_parsing,
+                settings.parquet.enable_materialized_json_subcolumns,
                 settings.parquet.use_native_reader_v3);
         });
 }

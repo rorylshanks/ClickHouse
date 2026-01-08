@@ -305,6 +305,7 @@ struct FormatSettings
         bool use_offset_index = true;
         bool use_native_reader_v3 = false;
         bool enable_json_parsing = true;
+        bool enable_materialized_json_subcolumns = false;
         bool preserve_order = false;
         bool enable_row_group_prefetch = true;
         bool verify_checksums = true;

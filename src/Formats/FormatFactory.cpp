@@ -202,6 +202,7 @@ FormatSettings getFormatSettings(const ContextPtr & context, const Settings & se
     format_settings.parquet.use_offset_index = settings[Setting::input_format_parquet_use_offset_index];
     format_settings.parquet.use_native_reader_v3 = settings[Setting::input_format_parquet_use_native_reader_v3];
     format_settings.parquet.enable_json_parsing = settings[Setting::input_format_parquet_enable_json_parsing];
+    format_settings.parquet.enable_materialized_json_subcolumns = settings[Setting::input_format_parquet_enable_materialized_json_subcolumns];
     format_settings.parquet.memory_low_watermark = settings[Setting::input_format_parquet_memory_low_watermark];
     format_settings.parquet.memory_high_watermark = settings[Setting::input_format_parquet_memory_high_watermark];
     format_settings.parquet.allow_missing_columns = settings[Setting::input_format_parquet_allow_missing_columns];

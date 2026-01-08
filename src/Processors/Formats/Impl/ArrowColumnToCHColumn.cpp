@@ -38,6 +38,8 @@
 #include <Interpreters/castColumn.h>
 #include <Common/quoteString.h>
 #include <Formats/insertNullAsDefaultIfNeeded.h>
+#include <MurmurHash3.h>
+#include <unordered_set>
 #include <algorithm>
 #include <arrow/builder.h>
 #include <arrow/array.h>
@@ -79,6 +81,44 @@ namespace ErrorCodes
     extern const int UNKNOWN_EXCEPTION;
     extern const int INCORRECT_DATA;
     extern const int LOGICAL_ERROR;
+}
+
+namespace
+{
+
+constexpr std::string_view JSON_MATERIALIZED_BUCKET_MARKER = "__json_type_bucket_";
+
+bool tryExtractJsonBaseFromSubcolumn(std::string_view name, String & base, String & path)
+{
+    auto dot_pos = name.find('.');
+    if (dot_pos == std::string_view::npos || dot_pos == 0 || dot_pos + 1 >= name.size())
+        return false;
+    base.assign(name.substr(0, dot_pos));
+    path.assign(name.substr(dot_pos + 1));
+    return true;
+}
+
+bool tryExtractJsonBaseFromBucket(std::string_view name, String & base)
+{
+    auto marker_pos = name.find(JSON_MATERIALIZED_BUCKET_MARKER);
+    if (marker_pos == std::string_view::npos || marker_pos == 0)
+        return false;
+    base.assign(name.substr(0, marker_pos));
+    return true;
+}
+
+UInt8 jsonMaterializedBucketForPath(std::string_view path)
+{
+    HashState out{};
+    MurmurHash3_x64_128(path.data(), path.size(), 0, out);
+    return static_cast<UInt8>(out.h1 & 0xFF);
+}
+
+String jsonMaterializedBucketColumnName(std::string_view base, std::string_view path)
+{
+    return String(base) + String(JSON_MATERIALIZED_BUCKET_MARKER) + std::to_string(jsonMaterializedBucketForPath(path));
+}
+
 }
 
 static bool emptyTimezoneAsUTC(const std::string & format_name, const FormatSettings & format_settings)
@@ -1506,8 +1546,43 @@ Block ArrowColumnToCHColumn::arrowSchemaToCHHeader(
     const std::string * geo_json_str = extractGeoMetadata(metadata);
     std::unordered_map<String, GeoColumnMetadata> geo_columns = parseGeoMetadataEncoding(geo_json_str);
 
+    std::unordered_set<String> json_materialized_bases;
+    if (format_name == "Parquet" && format_settings.parquet.enable_materialized_json_subcolumns)
+    {
+        std::unordered_set<String> direct_columns;
+        std::unordered_set<String> derived_bases;
+
+        direct_columns.reserve(schema.num_fields());
+        derived_bases.reserve(schema.num_fields());
+
+        for (const auto & field : schema.fields())
+        {
+            const auto & name = field->name();
+            String base;
+            String path;
+            if (tryExtractJsonBaseFromSubcolumn(name, base, path) || tryExtractJsonBaseFromBucket(name, base))
+                derived_bases.insert(base);
+            else
+                direct_columns.insert(name);
+        }
+
+        for (const auto & base : derived_bases)
+        {
+            if (direct_columns.contains(base))
+                json_materialized_bases.insert(base);
+        }
+    }
+
     for (const auto & field : schema.fields())
     {
+        if (format_name == "Parquet" && format_settings.parquet.enable_materialized_json_subcolumns)
+        {
+            String base;
+            /// Only skip bucket columns from schema - expose direct subcolumns (like properties.$ip)
+            if (tryExtractJsonBaseFromBucket(field->name(), base) && json_materialized_bases.contains(base))
+                continue;
+        }
+
         /// Create empty arrow column by it's type and convert it to ClickHouse column.
         auto arrow_column = createArrowColumn(field, format_name);
 
@@ -1642,12 +1717,16 @@ Chunk ArrowColumnToCHColumn::arrowColumnsToCHChunk(
             bool read_from_nested = false;
 
             /// Check if it's a subcolumn from some struct.
+            /// Skip this for JSON materialized subcolumns - they should be handled separately below
             String nested_table_name = Nested::extractTableName(header_column.name);
             String search_nested_table_name = nested_table_name;
             if (case_insensitive_matching)
                 boost::to_lower(search_nested_table_name);
 
-            if (name_to_arrow_column.contains(search_nested_table_name))
+            bool skip_nested_for_json = format_settings.parquet.enable_materialized_json_subcolumns
+                && header_column.name.find('.') != String::npos;
+
+            if (!skip_nested_for_json && name_to_arrow_column.contains(search_nested_table_name))
             {
                 if (!nested_tables.contains(search_nested_table_name))
                 {
@@ -1693,16 +1772,162 @@ Chunk ArrowColumnToCHColumn::arrowColumnsToCHChunk(
 
             if (!read_from_nested)
             {
-                if (!allow_missing_columns)
-                    throw Exception{ErrorCodes::THERE_IS_NO_COLUMN, "Column '{}' is not presented in input data.", header_column.name};
+                String json_base;
+                String json_path;
+                if (format_settings.parquet.enable_materialized_json_subcolumns
+                    && tryExtractJsonBaseFromSubcolumn(header_column.name, json_base, json_path))
+                {
+                    /// First try to find a direct column with the exact subcolumn name (e.g., "properties.$ip")
+                    /// This is more efficient than bucket lookup
+                    String direct_subcolumn_name = header_column.name;
+                    if (case_insensitive_matching)
+                        boost::to_lower(direct_subcolumn_name);
 
-                column.name = header_column.name;
-                column.type = header_column.type;
-                column.column = header_column.column->cloneResized(num_rows);
-                columns.push_back(std::move(column.column));
-                if (block_missing_values)
-                    block_missing_values->setBits(column_i, num_rows);
-                continue;
+                    auto direct_it = name_to_arrow_column.find(direct_subcolumn_name);
+                    if (direct_it != name_to_arrow_column.end())
+                    {
+                        column = readColumnFromArrowColumn(
+                            direct_it->second.column,
+                            header_column.name,
+                            header_column.name,
+                            dictionary_infos,
+                            header_column.type,
+                            direct_it->second.field->nullable(),
+                            false /*is_map_nested_column*/,
+                            geo_columns.contains(header_column.name) ? std::optional(geo_columns[header_column.name]) : std::nullopt,
+                            settings,
+                            direct_it->second.field,
+                            parquet_columns_to_clickhouse,
+                            clickhouse_columns_to_parquet);
+                        read_from_nested = true;
+                    }
+
+                    /// If no direct column, try bucket lookup
+                    if (!read_from_nested)
+                    {
+                        /// Count how many bucket columns exist for this base
+                        size_t num_buckets = 0;
+                        String bucket_prefix = String(json_base) + String(JSON_MATERIALIZED_BUCKET_MARKER);
+                        if (case_insensitive_matching)
+                            boost::to_lower(bucket_prefix);
+                        for (const auto & [col_name, _] : name_to_arrow_column)
+                        {
+                            if (col_name.starts_with(bucket_prefix))
+                                ++num_buckets;
+                        }
+
+                        String search_bucket_name;
+                        if (num_buckets > 0)
+                        {
+                            UInt8 raw_bucket = jsonMaterializedBucketForPath(json_path);
+                            UInt8 actual_bucket = raw_bucket % num_buckets;
+                            search_bucket_name = bucket_prefix + std::to_string(actual_bucket);
+                        }
+                        else
+                        {
+                            search_bucket_name = jsonMaterializedBucketColumnName(json_base, json_path);
+                            if (case_insensitive_matching)
+                                boost::to_lower(search_bucket_name);
+                        }
+
+                        auto bucket_it = name_to_arrow_column.find(search_bucket_name);
+                        if (bucket_it != name_to_arrow_column.end() && bucket_it->second.column)
+                        {
+                            /// Read bucket column using ClickHouse's Map reading
+                            auto bucket_type = std::make_shared<DataTypeMap>(
+                                std::make_shared<DataTypeString>(),
+                                std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>()));
+
+                            ColumnWithTypeAndName bucket_column = readColumnFromArrowColumn(
+                                bucket_it->second.column,
+                                search_bucket_name,
+                                search_bucket_name,
+                                dictionary_infos,
+                                bucket_type,
+                                bucket_it->second.field->nullable(),
+                                false,
+                                std::nullopt,
+                                settings,
+                                bucket_it->second.field,
+                                parquet_columns_to_clickhouse,
+                                clickhouse_columns_to_parquet);
+
+                            if (bucket_column.column)
+                            {
+                                auto result_column = header_column.type->createColumn();
+                                result_column->reserve(num_rows);
+
+                                /// Extract value from Map column using key lookup
+                                const IColumn * map_col_ptr = bucket_column.column.get();
+                                const ColumnNullable * nullable_map = typeid_cast<const ColumnNullable *>(map_col_ptr);
+                                if (nullable_map)
+                                    map_col_ptr = &nullable_map->getNestedColumn();
+
+                                const auto * map_column = typeid_cast<const ColumnMap *>(map_col_ptr);
+                                if (map_column)
+                                {
+                                    const auto & array_column = map_column->getNestedColumn();
+                                    const auto & tuple_column = map_column->getNestedData();
+                                    const auto & key_column = tuple_column.getColumn(0);
+                                    const auto & value_column = tuple_column.getColumn(1);
+                                    const auto & offsets = array_column.getOffsets();
+
+                                    for (size_t row = 0; row < num_rows; ++row)
+                                    {
+                                        size_t start = row == 0 ? 0 : offsets[row - 1];
+                                        size_t end = offsets[row];
+                                        bool found = false;
+
+                                        for (size_t pos = start; pos < end; ++pos)
+                                        {
+                                            auto key_ref = key_column.getDataAt(pos);
+                                            std::string_view key_view(key_ref.data(), key_ref.size());
+                                            if (key_view == json_path)
+                                            {
+                                                if (const auto * nullable_value = typeid_cast<const ColumnNullable *>(&value_column))
+                                                {
+                                                    if (nullable_value->isNullAt(pos))
+                                                        break;
+                                                    auto value_ref = nullable_value->getNestedColumn().getDataAt(pos);
+                                                    result_column->insert(String(value_ref.data(), value_ref.size()));
+                                                }
+                                                else
+                                                {
+                                                    auto value_ref = value_column.getDataAt(pos);
+                                                    result_column->insert(String(value_ref.data(), value_ref.size()));
+                                                }
+                                                found = true;
+                                                break;
+                                            }
+                                        }
+
+                                        if (!found)
+                                            result_column->insertDefault();
+                                    }
+
+                                    column.column = std::move(result_column);
+                                    column.type = header_column.type;
+                                    column.name = header_column.name;
+                                    read_from_nested = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (!read_from_nested)
+                {
+                    if (!allow_missing_columns)
+                        throw Exception{ErrorCodes::THERE_IS_NO_COLUMN, "Column '{}' is not presented in input data.", header_column.name};
+
+                    column.name = header_column.name;
+                    column.type = header_column.type;
+                    column.column = header_column.column->cloneResized(num_rows);
+                    columns.push_back(std::move(column.column));
+                    if (block_missing_values)
+                        block_missing_values->setBits(column_i, num_rows);
+                    continue;
+                }
             }
         }
         else
