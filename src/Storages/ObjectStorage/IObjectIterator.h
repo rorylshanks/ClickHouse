@@ -21,13 +21,15 @@ struct ObjectInfo
 
     ObjectInfo() = default;
 
-    explicit ObjectInfo(const String & relative_path_)
-        : relative_path_with_metadata(RelativePathWithMetadata(relative_path_))
+    explicit ObjectInfo(const String & relative_path_, std::optional<String> version_id_ = std::nullopt)
+        : relative_path_with_metadata(RelativePathWithMetadata(relative_path_, std::nullopt, std::move(version_id_)))
     {
     }
-    explicit ObjectInfo(RelativePathWithMetadata relative_path_with_metadata_)
-        : relative_path_with_metadata(relative_path_with_metadata_)
+    explicit ObjectInfo(RelativePathWithMetadata relative_path_with_metadata_, std::optional<String> version_id_ = std::nullopt)
+        : relative_path_with_metadata(std::move(relative_path_with_metadata_))
     {
+        if (version_id_)
+            relative_path_with_metadata.version_id = std::move(version_id_);
     }
 
     ObjectInfo(const ObjectInfo & other) = default;
