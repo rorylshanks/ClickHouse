@@ -8,7 +8,7 @@
 #include <Formats/FormatFilterInfo.h>
 #include <Formats/FormatParserSharedResources.h>
 #include <Processors/Formats/IOutputFormat.h>
-#include <Processors/Sources/SourceFromSingleChunk.h>
+#include <Processors/Sources/NullSource.h>
 #include <Processors/QueryPlan/QueryPlan.h>
 #include <Processors/QueryPlan/SourceStepWithFilter.h>
 #include <QueryPipeline/Pipe.h>
@@ -847,11 +847,7 @@ void ReadFromClickLake::initializePipeline(QueryPipelineBuilder & pipeline, cons
     const auto & local_context = getContext();
     auto init_empty_pipeline = [&]()
     {
-        auto header = local_storage_snapshot->getSampleBlockForColumns(column_names);
-        auto shared_header = std::make_shared<const Block>(header);
-        Chunk empty_chunk(header.cloneEmptyColumns(), 0);
-        auto source = std::make_shared<SourceFromSingleChunk>(shared_header, std::move(empty_chunk));
-        pipeline.init(Pipe(source));
+        pipeline.init(Pipe(std::make_shared<NullSource>(getOutputHeader())));
     };
 
     if (response.urls.empty())
