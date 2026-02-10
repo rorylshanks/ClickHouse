@@ -11,6 +11,7 @@
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/DataTypeNested.h>
+#include <DataTypes/DataTypeObject.h>
 #include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/NestedUtils.h>
 #include <IO/ReadBuffer.h>
@@ -749,6 +750,9 @@ std::optional<const ColumnDescription> ColumnsDescription::tryGetColumnDescripti
         auto jt = subcolumns.get<0>().find(column_name);
         if (jt != subcolumns.get<0>().end())
             return ColumnDescription{jt->name, jt->type};
+
+        if (auto dynamic_subcolumn = tryGetDynamicSubcolumn(column_name))
+            return ColumnDescription{dynamic_subcolumn->name, dynamic_subcolumn->type};
     }
 
     return {};
@@ -975,6 +979,8 @@ std::optional<NameAndTypePair> ColumnsDescription::tryGetDynamicSubcolumn(const 
         {
             if (auto dynamic_subcolumn_type = it->type->tryGetSubcolumnType(dynamic_subcolumn_name))
                 return NameAndTypePair(String(ordinary_column_name), String(dynamic_subcolumn_name), it->type, dynamic_subcolumn_type);
+            if (const auto * object_type = typeid_cast<const DataTypeObject *>(it->type.get()))
+                return NameAndTypePair(String(ordinary_column_name), String(dynamic_subcolumn_name), it->type, object_type->getDynamicType());
         }
     }
 

@@ -590,7 +590,13 @@ void StorageObjectStorageQueue::read(
 
     auto this_ptr = std::static_pointer_cast<StorageObjectStorageQueue>(shared_from_this());
 
-    auto read_from_format_info = prepareReadingFromFormat(column_names, storage_snapshot, local_context, supportsSubsetOfColumns(local_context));
+    auto read_from_format_info = prepareReadingFromFormat(
+        column_names,
+        storage_snapshot,
+        local_context,
+        supportsSubsetOfColumns(local_context),
+        /*supports_tuple_elements=*/ false,
+        /*supports_dynamic_subcolumns=*/ false);
 
     auto reading = std::make_unique<ReadFromObjectStorageQueue>(
         column_names,
@@ -855,6 +861,7 @@ bool StorageObjectStorageQueue::streamToViews(size_t streaming_tasks_index)
             queue_context,
             supportsSubsetOfColumns(queue_context),
             /*supports_tuple_elements*/ false,
+            /*supports_dynamic_subcolumns*/ false,
             PrepareReadingFromFormatHiveParams {file_columns,
                 hive_partition_columns_to_read_from_file_path.getNameToTypeMap()}
         );

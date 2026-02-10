@@ -647,7 +647,7 @@ void ReadManager::scheduleTask(Task task, bool is_first_in_group, MemoryUsageDif
                 RowSubgroup & row_subgroup = row_group.subgroups.at(task.row_subgroup_idx);
                 ColumnSubchunk & subchunk = row_subgroup.columns.at(task.column_idx);
 
-                reader.determinePagesToPrefetch(column, row_subgroup, row_group, prefetches);
+                reader.determinePagesToPrefetch(column, row_subgroup, row_group, reader.primitive_columns.at(task.column_idx), prefetches);
 
                 /// Side note: would be nice to avoid reading the dictionary if all dictionary-encoded
                 /// pages were filtered out (e.g. if it's a 100 MB column chunk with unique long strings,

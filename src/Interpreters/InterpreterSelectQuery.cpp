@@ -783,6 +783,11 @@ InterpreterSelectQuery::InterpreterSelectQuery(
 
         query_info.syntax_analyzer_result = syntax_analyzer_result;
         context->setDistributed(syntax_analyzer_result->is_remote_storage);
+        if (syntax_analyzer_result->storage_snapshot && syntax_analyzer_result->storage_snapshot != storage_snapshot)
+        {
+            storage_snapshot = syntax_analyzer_result->storage_snapshot;
+            metadata_snapshot = storage_snapshot->metadata;
+        }
 
         if (storage && !query.final() && storage->needRewriteQueryWithFinal(syntax_analyzer_result->requiredSourceColumns()))
             query.setFinal();

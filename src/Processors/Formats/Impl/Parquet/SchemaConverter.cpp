@@ -9,6 +9,7 @@
 #include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeObject.h>
+#include <DataTypes/DataTypeDynamic.h>
 #include <DataTypes/DataTypesDecimal.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeTuple.h>
@@ -16,7 +17,12 @@
 #include <Formats/FormatFilterInfo.h>
 #include <Processors/Formats/Impl/Parquet/Decoding.h>
 
+#include <Core/Types.h>
+#include <MurmurHash3.h>
+#include <boost/algorithm/string.hpp>
 #include <fmt/ranges.h>
+#include <algorithm>
+#include <cctype>
 
 namespace DB::ErrorCodes
 {
@@ -32,6 +38,39 @@ namespace DB::ErrorCodes
 
 namespace DB::Parquet
 {
+
+namespace
+{
+String normalizeColumnName(const String & name, bool case_insensitive)
+{
+    return case_insensitive ? boost::to_lower_copy(name) : name;
+}
+
+UInt128 murmurHash128(std::string_view key)
+{
+#if defined(_MURMURHASH3_H_) && !defined(MURMURHASH3_H)
+    HashState state;
+    MurmurHash3_x64_128(key.data(), key.size(), 0, state);
+    return (UInt128(state.h2) << 64) | state.h1;
+#else
+    UInt128 hash;
+    MurmurHash3_x64_128(key.data(), key.size(), 0, &hash);
+    return hash;
+#endif
+}
+
+size_t skipSubtree(const parq::FileMetaData & metadata, size_t idx)
+{
+    const auto & element = metadata.schema.at(idx);
+    size_t next = idx + 1;
+    if (element.__isset.num_children && element.num_children > 0)
+    {
+        for (int i = 0; i < element.num_children; ++i)
+            next = skipSubtree(metadata, next);
+    }
+    return next;
+}
+}
 
 SchemaConverter::SchemaConverter(
     const parq::FileMetaData & file_metadata_, const ReadOptions & options_,
@@ -65,6 +104,8 @@ void SchemaConverter::prepareForReading()
     chassert(sample_block);
     checkHasColumns();
 
+    prepareDynamicSubcolumnRequests();
+
     /// DFS the schema tree.
     size_t top_level_columns = size_t(file_metadata.schema.at(0).num_children);
     for (size_t i = 0; i < top_level_columns; ++i)
@@ -86,8 +127,8 @@ void SchemaConverter::prepareForReading()
 
         for (size_t i = col.primitive_start; i < col.primitive_end; ++i)
         {
-            chassert(primitive_columns.at(i).idx_in_output_block == UINT64_MAX);
-            primitive_columns.at(i).idx_in_output_block = idx;
+            if (primitive_columns.at(i).idx_in_output_block == UINT64_MAX)
+                primitive_columns.at(i).idx_in_output_block = idx;
         }
     }
     for (const auto & p : primitive_columns)
@@ -112,6 +153,97 @@ void SchemaConverter::prepareForReading()
         missing_output.input_type = sample_block->getByPosition(i).type;
         missing_output.output_type = missing_output.input_type;
         missing_output.is_missing_column = true;
+    }
+}
+
+void SchemaConverter::prepareDynamicSubcolumnRequests()
+{
+    if (!sample_block)
+        return;
+    const bool use_materialized_buckets = options.format.parquet.enable_materialized_json_subcolumns;
+
+    const bool case_insensitive = options.format.parquet.case_insensitive_column_matching;
+    std::unordered_set<String> file_columns;
+
+    /// Collect top-level column names and bucket columns from the parquet schema.
+    size_t schema_pos = 1;
+    size_t top_level_columns = size_t(file_metadata.schema.at(0).num_children);
+    for (size_t i = 0; i < top_level_columns; ++i)
+    {
+        const auto & element = file_metadata.schema.at(schema_pos);
+        const String mapped_name = String(useColumnMapperIfNeeded(element));
+        file_columns.insert(normalizeColumnName(mapped_name, case_insensitive));
+
+        const String normalized_name = normalizeColumnName(mapped_name, case_insensitive);
+        if (use_materialized_buckets)
+        {
+            const String bucket_prefix = "__json_type_bucket_";
+            auto pos = normalized_name.find(bucket_prefix);
+            if (pos != String::npos && pos + bucket_prefix.size() < normalized_name.size())
+            {
+                String parent = normalized_name.substr(0, pos);
+                String suffix = normalized_name.substr(pos + bucket_prefix.size());
+                if (!suffix.empty() && std::all_of(suffix.begin(), suffix.end(), [](unsigned char ch) { return std::isdigit(ch); }))
+                {
+                    auto index = static_cast<size_t>(std::stoull(suffix));
+                    auto & info = bucket_columns_by_parent[parent];
+                    info.index_to_name.emplace(index, mapped_name);
+                    info.num_buckets = std::max(info.num_buckets, index + 1);
+                }
+            }
+        }
+
+        schema_pos = skipSubtree(file_metadata, schema_pos);
+    }
+
+    /// Collect requested dynamic subcolumns and map them to bucket columns if direct columns are absent.
+    for (size_t i = 0; i < sample_block->columns(); ++i)
+    {
+        const auto & col = sample_block->getByPosition(i);
+        DataTypePtr type = col.type;
+        if (type->isNullable())
+            type = assert_cast<const DataTypeNullable &>(*type).getNestedType();
+        if (!isDynamic(*type))
+            continue;
+
+        const auto dot_pos = col.name.find('.');
+        if (dot_pos == String::npos || dot_pos + 1 >= col.name.size())
+            continue;
+
+        const String parent_name = col.name.substr(0, dot_pos);
+        const String subcolumn_name = col.name.substr(dot_pos + 1);
+
+        if (file_columns.contains(normalizeColumnName(col.name, case_insensitive)))
+            continue;
+
+        DynamicSubcolumnRequest request;
+        request.full_name = col.name;
+        request.parent_name = parent_name;
+        request.subcolumn_name = subcolumn_name;
+        request.idx_in_output_block = i;
+        request.output_type = col.type;
+
+        if (use_materialized_buckets)
+        {
+            const auto bucket_it = bucket_columns_by_parent.find(normalizeColumnName(parent_name, case_insensitive));
+            if (bucket_it == bucket_columns_by_parent.end() || bucket_it->second.num_buckets == 0)
+                continue;
+
+            const UInt128 hash = murmurHash128(subcolumn_name);
+            /// Use low 64 bits for bucket selection to match clicklake ingestion/backfill.
+            const auto bucket_idx = static_cast<size_t>(UInt64(hash) % bucket_it->second.num_buckets);
+            const auto name_it = bucket_it->second.index_to_name.find(bucket_idx);
+            if (name_it == bucket_it->second.index_to_name.end())
+                continue;
+
+            bucket_column_requests[normalizeColumnName(name_it->second, case_insensitive)].push_back(std::move(request));
+        }
+        else
+        {
+            if (!file_columns.contains(normalizeColumnName(parent_name, case_insensitive)))
+                continue;
+            bucket_column_requests[normalizeColumnName(parent_name, case_insensitive)].push_back(std::move(request));
+        }
     }
 }
 
@@ -173,6 +305,15 @@ void SchemaConverter::processSubtree(TraversalNode & node)
 
         if (sample_block)
         {
+            const bool case_insensitive = options.format.parquet.case_insensitive_column_matching;
+            auto bucket_it = bucket_column_requests.find(normalizeColumnName(node.name, case_insensitive));
+            if (!node.requested && bucket_it != bucket_column_requests.end())
+            {
+                node.requested = true;
+                node.type_hint = std::make_shared<DataTypeObject>(DataTypeObject::SchemaFormat::JSON);
+                outer_type_hint = node.type_hint;
+            }
+
             /// Doing this lookup on each schema element to support reading individual tuple elements.
             /// E.g.:
             ///   insert into function file('t.parquet') select [(10,20,30)] as x;
@@ -329,6 +470,13 @@ bool SchemaConverter::processSubtreePrimitive(TraversalNode & node)
             output_nullable = true;
             primitive_type_hint = assert_cast<const DataTypeNullable &>(*primitive_type_hint).getNestedType();
         }
+        /// Even if the type hint is not nullable, if the Parquet column is OPTIONAL (nullable),
+        /// we should read it as nullable so that NULL values can be properly passed through to the cast.
+        /// This is important for types like Dynamic and JSON that can store NULL values internally.
+        else if (node.schema_context != SchemaContext::MapKey && levels.back().is_array == false)
+        {
+            output_nullable = true;
+        }
     }
     /// Force map key to be non-nullable because clickhouse Map doesn't support nullable map key.
     else if (!options.schema_inference_force_not_nullable && node.schema_context != SchemaContext::MapKey)
@@ -348,6 +496,14 @@ bool SchemaConverter::processSubtreePrimitive(TraversalNode & node)
                 /// Keep this behavior for compatibility.
                 output_nullable_if_not_json = true;
         }
+    }
+
+    if (options.format.parquet.enable_materialized_json_subcolumns &&
+        node.name.find("__json_type_bucket_") != String::npos)
+    {
+        primitive_type_hint = std::make_shared<DataTypeString>();
+        output_nullable = true;
+        output_nullable_if_not_json = false;
     }
 
     auto geo_it = geo_columns.find(node.getParquetName());
@@ -400,6 +556,8 @@ bool SchemaConverter::processSubtreePrimitive(TraversalNode & node)
     output.primitive_start = primitive_idx;
     output.primitive_end = primitive_idx + 1;
     output.is_primitive = true;
+    output.is_json_bucket_column = options.format.parquet.enable_materialized_json_subcolumns
+        && node.name.find("__json_type_bucket_") != String::npos;
 
     if (!primitive.decoded_type)
         primitive.decoded_type = inferred_type;
@@ -414,6 +572,43 @@ bool SchemaConverter::processSubtreePrimitive(TraversalNode & node)
     output.input_type = primitive.output_type;
     output.output_type = node.type_hint ? node.type_hint : inferred_type;
     output.needs_cast = !output.output_type->equals(*output.input_type);
+
+    if (sample_block)
+    {
+        const bool case_insensitive = options.format.parquet.case_insensitive_column_matching;
+        auto bucket_it = bucket_column_requests.find(normalizeColumnName(node.name, case_insensitive));
+        if (bucket_it != bucket_column_requests.end())
+        {
+            if (output.is_json_bucket_column)
+            {
+                output.output_type = std::make_shared<DataTypeObject>(DataTypeObject::SchemaFormat::JSON);
+                output.needs_cast = !output.output_type->equals(*output.input_type);
+            }
+            const auto base_output_type = output.output_type;
+            const bool base_is_bucket = output.is_json_bucket_column;
+            for (const auto & request : bucket_it->second)
+            {
+                OutputColumnInfo & derived = output_columns.emplace_back();
+                derived.name = request.full_name;
+                derived.primitive_start = primitive_idx;
+                derived.primitive_end = primitive_idx + 1;
+                derived.base_output_idx = node.output_idx;
+                derived.subcolumn_name = request.subcolumn_name;
+                derived.input_type = base_output_type->tryGetSubcolumnType(request.subcolumn_name);
+                if (!derived.input_type)
+                    derived.input_type = request.output_type;
+                derived.output_type = request.output_type;
+                if (base_is_bucket &&
+                    base_output_type->isNullable() &&
+                    !derived.output_type->isNullable())
+                {
+                    derived.output_type = std::make_shared<DataTypeNullable>(derived.output_type);
+                }
+                derived.needs_cast = !derived.output_type->equals(*derived.input_type);
+                derived.idx_in_output_block = request.idx_in_output_block;
+            }
+        }
+    }
 
     return true;
 }

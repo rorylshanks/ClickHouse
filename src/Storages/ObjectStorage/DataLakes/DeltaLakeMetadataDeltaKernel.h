@@ -48,7 +48,8 @@ public:
         const StorageSnapshotPtr & storage_snapshot,
         const ContextPtr & context,
         bool supports_subset_of_columns,
-        bool supports_tuple_elements) override;
+        bool supports_tuple_elements,
+        bool supports_dynamic_subcolumns) override;
 
     bool operator ==(const IDataLakeMetadata &) const override;
 

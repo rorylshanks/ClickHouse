@@ -38,6 +38,8 @@
 #include <Common/thread_local_rng.h>
 #include <Common/logger_useful.h>
 
+#include <boost/algorithm/string.hpp>
+
 #include <TableFunctions/TableFunctionURL.h>
 
 #include <Formats/SchemaInferenceUtils.h>
@@ -1192,12 +1194,16 @@ void IStorageURLBase::read(
         num_streams = local_context->getSettingsRef()[Setting::max_streams_for_files_processing_in_cluster_functions];
 
     auto params = getReadURIParams(column_names, storage_snapshot, query_info, local_context, processed_stage, max_block_size);
+    const bool supports_dynamic_subcolumns = boost::iequals(format_name, "Parquet")
+        && ::DB::getFormatSettings(local_context).parquet.use_native_reader_v3;
+    const bool supports_tuple_elements = supports_prewhere || supports_dynamic_subcolumns;
     auto read_from_format_info = prepareReadingFromFormat(
         column_names,
         storage_snapshot,
         local_context,
         supportsSubsetOfColumns(local_context),
-        /*supports_tuple_elements=*/ supports_prewhere,
+        /*supports_tuple_elements=*/ supports_tuple_elements,
+        supports_dynamic_subcolumns,
         PrepareReadingFromFormatHiveParams {file_columns, hive_partition_columns_to_read_from_file_path.getNameToTypeMap()});
 
     if (query_info.prewhere_info || query_info.row_level_filter)
@@ -1372,12 +1378,16 @@ void StorageURLWithFailover::read(
     size_t num_streams)
 {
     auto params = getReadURIParams(column_names, storage_snapshot, query_info, local_context, processed_stage, max_block_size);
+    const bool supports_dynamic_subcolumns = boost::iequals(format_name, "Parquet")
+        && ::DB::getFormatSettings(local_context).parquet.use_native_reader_v3;
+    const bool supports_tuple_elements = supports_prewhere || supports_dynamic_subcolumns;
     auto read_from_format_info = prepareReadingFromFormat(
         column_names,
         storage_snapshot,
         local_context,
         supportsSubsetOfColumns(local_context),
-        /*supports_tuple_elements=*/ supports_prewhere,
+        /*supports_tuple_elements=*/ supports_tuple_elements,
+        supports_dynamic_subcolumns,
         PrepareReadingFromFormatHiveParams {file_columns, hive_partition_columns_to_read_from_file_path.getNameToTypeMap()});
 
     if (query_info.prewhere_info || query_info.row_level_filter)

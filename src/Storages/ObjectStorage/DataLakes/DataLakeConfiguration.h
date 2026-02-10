@@ -394,6 +394,7 @@ private:
         const StorageSnapshotPtr & storage_snapshot,
         bool supports_subset_of_columns,
         bool supports_tuple_elements,
+        bool supports_dynamic_subcolumns,
         ContextPtr local_context,
         const PrepareReadingFromFormatHiveParams &) override
     {
@@ -405,7 +406,12 @@ private:
                 local_context);
         }
         return current_metadata->prepareReadingFromFormat(
-            requested_columns, storage_snapshot, local_context, supports_subset_of_columns, supports_tuple_elements);
+            requested_columns,
+            storage_snapshot,
+            local_context,
+            supports_subset_of_columns,
+            supports_tuple_elements,
+            supports_dynamic_subcolumns);
     }
 };
 

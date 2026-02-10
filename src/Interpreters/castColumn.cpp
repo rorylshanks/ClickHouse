@@ -13,6 +13,15 @@ namespace DB
 
 static ColumnPtr castColumn(CastType cast_type, const ColumnWithTypeAndName & arg, const DataTypePtr & type, InternalCastFunctionCache * cache = nullptr)
 {
+    if (!arg.type || !type || !arg.column)
+    {
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "castColumn called with NULL argument: arg.type={}, type={}, arg.column={}",
+            arg.type ? "set" : "NULL",
+            type ? "set" : "NULL",
+            arg.column ? "set" : "NULL");
+    }
     if (arg.type->equals(*type) && cast_type != CastType::accurateOrNull)
         return arg.column;
 

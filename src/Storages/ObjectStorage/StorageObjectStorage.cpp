@@ -6,6 +6,8 @@
 #include <Core/Settings.h>
 #include <Formats/FormatFactory.h>
 #include <Formats/ReadSchemaUtils.h>
+
+#include <boost/algorithm/string.hpp>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
@@ -434,12 +436,16 @@ void StorageObjectStorage::read(
         }
     }
 #endif
+    const bool supports_dynamic_subcolumns = boost::iequals(configuration->format, "Parquet")
+        && ::DB::getFormatSettings(local_context).parquet.use_native_reader_v3;
+    const bool supports_tuple_elements_with_dynamic = supports_tuple_elements || supports_dynamic_subcolumns;
     auto read_from_format_info = configuration->prepareReadingFromFormat(
         object_storage,
         column_names,
         storage_snapshot,
         supportsSubsetOfColumns(local_context),
-        supports_tuple_elements,
+        supports_tuple_elements_with_dynamic,
+        supports_dynamic_subcolumns,
         local_context,
         PrepareReadingFromFormatHiveParams{ file_columns, hive_partition_columns_to_read_from_file_path.getNameToTypeMap() });
 
@@ -455,7 +461,7 @@ void StorageObjectStorage::read(
 
     auto modified_format_settings{format_settings};
     if (!modified_format_settings.has_value())
-        modified_format_settings.emplace(getFormatSettings(local_context));
+        modified_format_settings.emplace(::DB::getFormatSettings(local_context));
 
     configuration->modifyFormatSettings(modified_format_settings.value(), *local_context);
 

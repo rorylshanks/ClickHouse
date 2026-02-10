@@ -174,6 +174,7 @@ public:
         const StorageSnapshotPtr & storage_snapshot,
         bool supports_subset_of_columns,
         bool supports_tuple_elements,
+        bool supports_dynamic_subcolumns,
         ContextPtr local_context,
         const PrepareReadingFromFormatHiveParams & hive_parameters);
 

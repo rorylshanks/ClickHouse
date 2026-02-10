@@ -62,7 +62,8 @@ namespace DB
     /// If false, we'll ask the format to read the whole tuple "t"; then the needed subcolumns are
     /// extracted by ExtractColumnsTransform later in the pipeline.
     /// For subcolumns that are not tuple elements (e.g. dynamic subcolumns "json_column.some_map_key"
-    /// or special subcolumns like "nullable.null" for null map), we request the whole column either way.
+    /// or special subcolumns like "nullable.null" for null map), we request the whole column unless
+    /// supports_dynamic_subcolumns is enabled.
     /// Note: currently `supports_tuple_elements` just means ParquetV3BlockInputFormat; if in future
     /// we add support for other subcolumn types in ParquetV3BlockInputFormat, we can just rename
     /// this bool instead of adding another one.
@@ -72,10 +73,11 @@ namespace DB
         const ContextPtr & context,
         bool supports_subset_of_columns,
         bool supports_tuple_elements = false,
+        bool supports_dynamic_subcolumns = false,
         const PrepareReadingFromFormatHiveParams & hive_parameters = {});
 
     /// Returns columns_to_read from file.
-    Names filterTupleColumnsToRead(NamesAndTypesList & requested_columns);
+    Names filterTupleColumnsToRead(NamesAndTypesList & requested_columns, bool supports_dynamic_subcolumns);
 
     ReadFromFormatInfo updateFormatPrewhereInfo(const ReadFromFormatInfo & info, const FilterDAGInfoPtr & row_level_filter, const PrewhereInfoPtr & prewhere_info);
 

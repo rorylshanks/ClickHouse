@@ -11,6 +11,7 @@
 #include <Storages/MergeTree/KeyCondition.h>
 
 #include <deque>
+#include <mutex>
 #include <optional>
 
 namespace DB
@@ -201,6 +202,12 @@ struct Reader
         /// Column not in the file, fill it with default values.
         bool is_missing_column = false;
         bool needs_cast = false; // if output_type is different from input_type
+        /// True if this column is a JSON bucket column (name contains `__json_type_bucket_`).
+        /// Used to handle NULL replacement with empty JSON objects during reading.
+        bool is_json_bucket_column = false;
+        /// Derive a subcolumn from another output column (e.g. JSON dynamic subcolumn).
+        std::optional<size_t> base_output_idx;
+        String subcolumn_name;
 
         /// If type is Array, this is the repetition level of that array.
         /// `rep - 1` is index in ColumnChunk::arrays_offsets.
@@ -392,6 +399,11 @@ struct Reader
 
         std::vector<OutputColumnState> output; // parallel to extended_sample_block
 
+        /// Cache for formed output columns by output_column_idx, used when the same base column
+        /// is needed by multiple derived columns (e.g., JSON subcolumns from the same bucket).
+        std::unordered_map<size_t, MutableColumnPtr> formed_output_columns_cache;
+        mutable std::mutex formed_output_columns_cache_mutex;
+
         std::atomic<ReadStage> stage {ReadStage::NotStarted};
         std::atomic<size_t> stage_tasks_remaining {0};
     };
@@ -504,7 +516,12 @@ struct Reader
     /// Call after prewhere is done on row subgroup. Un-requests prefetch for fully filtered out pages,
     /// adds pages that need prefetch to `out`. Must be called in order.
     /// May assign dictionary_page_prefetch.
-    void determinePagesToPrefetch(ColumnChunk & column, const RowSubgroup & row_subgroup, const RowGroup & row_group, std::vector<PrefetchHandle *> & out);
+    void determinePagesToPrefetch(
+        ColumnChunk & column,
+        const RowSubgroup & row_subgroup,
+        const RowGroup & row_group,
+        const PrimitiveColumnInfo & column_info,
+        std::vector<PrefetchHandle *> & out);
 
     /// Guess how much memory ColumnSubchunk::{column, arrays_offsets} will use, per row.
     double estimateColumnMemoryBytesPerRow(const ColumnChunk & column, const RowGroup & row_group, const PrimitiveColumnInfo & column_info) const;

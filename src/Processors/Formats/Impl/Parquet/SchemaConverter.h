@@ -42,6 +42,26 @@ struct SchemaConverter
     NamesAndTypesList inferSchema();
 
 private:
+    struct DynamicSubcolumnRequest
+    {
+        String full_name;
+        String parent_name;
+        String subcolumn_name;
+        size_t idx_in_output_block = 0;
+        DataTypePtr output_type;
+    };
+
+    struct BucketInfo
+    {
+        std::unordered_map<size_t, String> index_to_name;
+        size_t num_buckets = 0;
+    };
+
+    std::unordered_map<String, BucketInfo> bucket_columns_by_parent;
+    std::unordered_map<String, std::vector<DynamicSubcolumnRequest>> bucket_column_requests;
+
+    void prepareDynamicSubcolumnRequests();
+
     /// If we interpret the parquet schema tree in a straightforward way, ignoring List/Map type
     /// annotations, we get some extra layers of tuples:
     /// Instead of `foo Array(Int64)` we'd get `foo Tuple(list Array(Tuple(element Int64)))`.
