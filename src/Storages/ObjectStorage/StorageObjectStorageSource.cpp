@@ -858,10 +858,10 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     if (use_distributed_cache)
     {
         const std::string path = object_info.getPath();
-        StoredObject object(path, "", object_size);
-        auto read_buffer_creator = [path, object_size, modified_read_settings, object_storage]()
+        StoredObject object(path, "", object_size, object_info.version_id);
+        auto read_buffer_creator = [object, nested_buffer_read_settings = modified_read_settings.withNestedBuffer(/* seekable */false), object_storage]()
         {
-            return object_storage->readObject(StoredObject(path, "", object_size), modified_read_settings.withNestedBuffer(/* seekable */false));
+            return object_storage->readObject(object, nested_buffer_read_settings);
         };
 
         impl = std::make_unique<ReadBufferFromDistributedCache>(
@@ -896,11 +896,12 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
 
             auto read_buffer_creator = [
                 path = object_info.getPath(),
+                version_id = object_info.version_id,
                 nested_buffer_read_settings = modified_read_settings.withNestedBuffer(/* seekable */false),
                 object_size,
                 object_storage]()
             {
-                return object_storage->readObject(StoredObject(path, "", object_size), nested_buffer_read_settings);
+                return object_storage->readObject(StoredObject(path, "", object_size, version_id), nested_buffer_read_settings);
             };
 
             impl = std::make_unique<CachedOnDiskReadBufferFromFile>(
@@ -930,7 +931,7 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     if (!impl)
     {
         impl = object_storage->readObject(
-            StoredObject(object_info.getPath(), "", object_size),
+            StoredObject(object_info.getPath(), "", object_size, object_info.version_id),
             use_async_buffer ? modified_read_settings.withNestedBuffer(/* seekable */true) : modified_read_settings);
     }
 

@@ -209,12 +209,13 @@ std::unique_ptr<ReadBufferFromFileBase> S3ObjectStorage::readObject( /// NOLINT
     const ReadSettings & read_settings,
     std::optional<size_t>) const
 {
+    const String version_id = object.version_id.value_or(uri.version_id);
     auto settings_ptr = s3_settings.get();
     return std::make_unique<ReadBufferFromS3>(
         client.get(),
         uri.bucket,
         object.remote_path,
-        uri.version_id,
+        version_id,
         settings_ptr->request_settings,
         patchSettings(read_settings),
         read_settings.remote_read_buffer_use_external_buffer,

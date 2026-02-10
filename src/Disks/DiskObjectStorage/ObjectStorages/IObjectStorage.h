@@ -116,12 +116,17 @@ struct RelativePathWithMetadata
     String relative_path;
     /// Object metadata: size, modification time, etc.
     std::optional<ObjectMetadata> metadata;
+    std::optional<String> version_id;
 
     RelativePathWithMetadata() = default;
 
-    explicit RelativePathWithMetadata(String relative_path_, std::optional<ObjectMetadata> metadata_ = std::nullopt)
+    explicit RelativePathWithMetadata(
+        String relative_path_,
+        std::optional<ObjectMetadata> metadata_ = std::nullopt,
+        std::optional<String> version_id_ = std::nullopt)
         : relative_path(std::move(relative_path_))
         , metadata(std::move(metadata_))
+        , version_id(std::move(version_id_))
     {}
 
     RelativePathWithMetadata(const RelativePathWithMetadata & other) = default;
