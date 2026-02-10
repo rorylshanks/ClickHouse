@@ -309,12 +309,28 @@ StorageClickLake::QueryResponse StorageClickLake::parseQueryResponse(const Strin
             return response;
         }
 
-        if (root->has("urls"))
+        if (root->has("files"))
         {
-            auto urls_array = root->getArray("urls");
-            const auto urls_size = static_cast<unsigned int>(urls_array->size());
-            for (unsigned int i = 0; i < urls_size; ++i)
-                response.urls.push_back(urls_array->getElement<String>(i));
+            auto files_array = root->getArray("files");
+            const auto files_size = static_cast<unsigned int>(files_array->size());
+            for (unsigned int i = 0; i < files_size; ++i)
+            {
+                auto file_obj = files_array->getObject(i);
+                QueryFile file;
+                if (file_obj->has("url"))
+                    file.url = file_obj->getValue<String>("url");
+                if (file_obj->has("key"))
+                    file.key = file_obj->getValue<String>("key");
+                if (file_obj->has("version_id"))
+                    file.version_id = file_obj->getValue<String>("version_id");
+                if (file_obj->has("etag"))
+                    file.etag = file_obj->getValue<String>("etag");
+                if (file_obj->has("size"))
+                    file.size = file_obj->getValue<UInt64>("size");
+                if (file_obj->has("last_modified"))
+                    file.last_modified = file_obj->getValue<UInt64>("last_modified");
+                response.files.push_back(std::move(file));
+            }
         }
 
         if (root->has("format"))
@@ -850,22 +866,22 @@ void ReadFromClickLake::initializePipeline(QueryPipelineBuilder & pipeline, cons
         pipeline.init(Pipe(std::make_shared<NullSource>(getOutputHeader())));
     };
 
-    if (response.urls.empty())
+    if (response.files.empty())
     {
         if (response.continuation_token)
         {
             throw Exception(
                 ErrorCodes::RECEIVED_ERROR_FROM_REMOTE_IO_SERVER,
-                "ClickLake returned invalid first page: continuation_token without URLs");
+                "ClickLake returned invalid first page: continuation_token without files");
         }
 
         /// No data to read - return empty source.
-        LOG_DEBUG(log, "No URLs returned from ClickLake server, returning empty result");
+        LOG_DEBUG(log, "No files returned from ClickLake server, returning empty result");
         init_empty_pipeline();
         return;
     }
 
-    LOG_DEBUG(log, "Got {} URLs from ClickLake server, format: {}", response.urls.size(), response.format);
+    LOG_DEBUG(log, "Got {} files from ClickLake server, format: {}", response.files.size(), response.format);
 
     /// Keep the context alive for the duration of the pipeline execution.
     /// This is critical for correlated subqueries where the subquery's context
@@ -953,11 +969,11 @@ void ReadFromClickLake::initializePipeline(QueryPipelineBuilder & pipeline, cons
     auto state = std::make_shared<URLPaginationState>();
 #if USE_AWS_S3
     auto s3_groups = std::make_shared<std::map<ClickLakeS3GroupKey, ClickLakeS3GroupInfo>>();
-    auto add_url = [state, s3_groups, local_context](const String & url, bool allow_new_groups, std::optional<String> & error)
+    auto add_file = [state, s3_groups, local_context](const StorageClickLake::QueryFile & file, bool allow_new_groups, std::optional<String> & error)
     {
         try
         {
-            auto s3_uri = tryParseS3URI(url, local_context);
+            auto s3_uri = tryParseS3URI(file.url, local_context);
             ClickLakeS3GroupKey key{.endpoint = s3_uri->endpoint, .bucket = s3_uri->bucket};
             auto it = s3_groups->find(key);
             if (it == s3_groups->end())
@@ -979,7 +995,25 @@ void ReadFromClickLake::initializePipeline(QueryPipelineBuilder & pipeline, cons
             }
             if (allow_new_groups)
                 it->second.initial_size++;
-            state->pending_s3[key].emplace_back(s3_uri->key, s3_uri->version_id);
+            std::optional<ObjectMetadata> metadata;
+            if (file.size > 0 || !file.etag.empty() || file.last_modified > 0)
+            {
+                ObjectMetadata object_metadata;
+                object_metadata.size_bytes = file.size;
+                object_metadata.etag = file.etag;
+                if (file.last_modified > 0)
+                {
+                    object_metadata.last_modified.fromEpochTime(static_cast<std::time_t>(file.last_modified));
+                }
+                metadata = std::move(object_metadata);
+            }
+
+            std::optional<String> version_id = s3_uri->version_id;
+            if (version_id == std::nullopt && !file.version_id.empty())
+                version_id = file.version_id;
+
+            RelativePathWithMetadata path_with_metadata{s3_uri->key, metadata, version_id};
+            state->pending_s3[key].emplace_back(path_with_metadata, version_id);
             return;
         }
         catch (const Exception & e)
@@ -994,7 +1028,7 @@ void ReadFromClickLake::initializePipeline(QueryPipelineBuilder & pipeline, cons
         }
     };
 #else
-    auto add_url = [](const String &, bool, std::optional<String> & error)
+    auto add_file = [](const StorageClickLake::QueryFile &, bool, std::optional<String> & error)
     {
         error = "ClickHouse was built without AWS S3 support";
     };
@@ -1002,8 +1036,8 @@ void ReadFromClickLake::initializePipeline(QueryPipelineBuilder & pipeline, cons
 
     {
         std::lock_guard lock(state->mutex);
-        for (const auto & url : response.urls)
-            add_url(url, /*allow_new_groups*/ true, state->error);
+        for (const auto & file : response.files)
+            add_file(file, /*allow_new_groups*/ true, state->error);
         if (state->error)
         {
             state->done = true;
@@ -1014,7 +1048,7 @@ void ReadFromClickLake::initializePipeline(QueryPipelineBuilder & pipeline, cons
         }
     }
     if (state->error)
-        throw Exception(ErrorCodes::RECEIVED_ERROR_FROM_REMOTE_IO_SERVER, "ClickLake returned invalid URLs: {}", *state->error);
+        throw Exception(ErrorCodes::RECEIVED_ERROR_FROM_REMOTE_IO_SERVER, "ClickLake returned invalid files: {}", *state->error);
 
     if (response.continuation_token)
     {
@@ -1024,7 +1058,7 @@ void ReadFromClickLake::initializePipeline(QueryPipelineBuilder & pipeline, cons
         auto query_id = response.query_id;
         auto storage_ptr = storage;
 
-        state->worker = std::thread([state, storage_ptr, cached_request_body, local_context, continuation_token, query_id, add_url]() mutable
+        state->worker = std::thread([state, storage_ptr, cached_request_body, local_context, continuation_token, query_id, add_file]() mutable
         {
             auto token = continuation_token;
             while (token && !state->cancelled.load())
@@ -1050,8 +1084,8 @@ void ReadFromClickLake::initializePipeline(QueryPipelineBuilder & pipeline, cons
 
                 {
                     std::lock_guard lock(state->mutex);
-                    for (const auto & url : next_response.urls)
-                        add_url(url, /*allow_new_groups*/ false, state->error);
+                    for (const auto & file : next_response.files)
+                        add_file(file, /*allow_new_groups*/ false, state->error);
                     if (state->error)
                         state->done = true;
                 }
@@ -1070,30 +1104,30 @@ void ReadFromClickLake::initializePipeline(QueryPipelineBuilder & pipeline, cons
 #if USE_AWS_S3
     if (!s3_groups->empty())
     {
-        size_t total_s3_urls = 0;
+        size_t total_s3_files = 0;
         for (const auto & [key, group] : *s3_groups)
-            total_s3_urls += group.initial_size;
+            total_s3_files += group.initial_size;
 
         size_t total_s3_streams = response.continuation_token
             ? max_streams
-            : (total_s3_urls > 0 ? std::min(max_streams, total_s3_urls) : 1);
+            : (total_s3_files > 0 ? std::min(max_streams, total_s3_files) : 1);
         if (total_s3_streams == 0)
             total_s3_streams = 1;
 
         size_t remaining_streams = total_s3_streams;
-        size_t remaining_urls = total_s3_urls;
+        size_t remaining_files = total_s3_files;
         for (auto & [key, group] : *s3_groups)
         {
             if (remaining_streams == 0)
                 break;
-            size_t group_streams = remaining_urls > 0
-                ? std::max<size_t>(1, total_s3_streams * group.initial_size / total_s3_urls)
+            size_t group_streams = remaining_files > 0
+                ? std::max<size_t>(1, total_s3_streams * group.initial_size / total_s3_files)
                 : 1;
             group_streams = std::min(group_streams, remaining_streams);
             group.streams = group_streams;
             remaining_streams -= group_streams;
-            if (remaining_urls >= group.initial_size)
-                remaining_urls -= group.initial_size;
+            if (remaining_files >= group.initial_size)
+                remaining_files -= group.initial_size;
         }
 
         while (remaining_streams > 0)
@@ -1173,7 +1207,7 @@ void ReadFromClickLake::initializePipeline(QueryPipelineBuilder & pipeline, cons
 #endif
 
     if (pipes.empty())
-        throw Exception(ErrorCodes::RECEIVED_ERROR_FROM_REMOTE_IO_SERVER, "ClickLake returned only unsupported URLs");
+        throw Exception(ErrorCodes::RECEIVED_ERROR_FROM_REMOTE_IO_SERVER, "ClickLake returned only unsupported files");
 
     auto pipe = Pipe::unitePipes(std::move(pipes));
     pipeline.init(std::move(pipe));

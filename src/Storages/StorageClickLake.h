@@ -77,9 +77,19 @@ public:
     ColumnSizeByName getColumnSizes() const override;
 
     /// Response from ClickLake server for SELECT queries
+    struct QueryFile
+    {
+        String url;
+        String key;
+        String version_id;
+        String etag;
+        UInt64 size = 0;
+        UInt64 last_modified = 0; /// Unix timestamp (seconds)
+    };
+
     struct QueryResponse
     {
-        std::vector<String> urls;           /// S3/HTTP URLs to read from
+        std::vector<QueryFile> files;       /// S3/HTTP file objects to read from
         std::optional<String> continuation_token;  /// For paginated results
         std::optional<String> query_id;     /// Snapshot query ID
         String format;                      /// Data format (e.g., "Parquet")
