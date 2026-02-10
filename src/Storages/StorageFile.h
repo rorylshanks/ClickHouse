@@ -295,6 +295,10 @@ private:
     std::optional<size_t> tryGetNumRowsFromCache(const String & path, time_t last_mod_time) const;
 
     std::shared_ptr<StorageFile> storage;
+    /// Store context as shared_ptr to keep it alive for the lifetime of the source.
+    /// This is needed because WithContext stores a weak_ptr, which can expire in
+    /// correlated subqueries where the context may be destroyed before generate() is called.
+    ContextPtr stored_context;
     FilesIteratorPtr files_iterator;
     String current_path;
     std::optional<size_t> current_file_size;

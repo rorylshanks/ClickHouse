@@ -38,6 +38,8 @@
 #include <Formats/FormatFactory.h>
 #include <Formats/ReadSchemaUtils.h>
 #include <Processors/Formats/IInputFormat.h>
+
+#include <boost/algorithm/string.hpp>
 #include <Processors/Formats/IOutputFormat.h>
 #include <Processors/Sinks/SinkToStorage.h>
 #include <Processors/Transforms/AddingDefaultsTransform.h>
@@ -1358,6 +1360,7 @@ StorageFileSource::StorageFileSource(
     : ISource(std::make_shared<const Block>(info.source_header), false)
     , WithContext(context_)
     , storage(std::move(storage_))
+    , stored_context(context_)
     , files_iterator(std::move(files_iterator_))
     , read_buf(std::move(read_buf_))
     , parser_shared_resources(std::move(parser_shared_resources_))
@@ -1810,12 +1813,16 @@ void StorageFile::read(
 
     auto this_ptr = std::static_pointer_cast<StorageFile>(shared_from_this());
 
+    const bool supports_dynamic_subcolumns = boost::iequals(format_name, "Parquet")
+        && ::DB::getFormatSettings(context).parquet.use_native_reader_v3;
+    const bool supports_tuple_elements = supports_prewhere || supports_dynamic_subcolumns;
     auto read_from_format_info = prepareReadingFromFormat(
         column_names,
         storage_snapshot,
         context,
         supportsSubsetOfColumns(context),
-        /*supports_tuple_elements=*/ supports_prewhere,
+        /*supports_tuple_elements=*/ supports_tuple_elements,
+        supports_dynamic_subcolumns,
         PrepareReadingFromFormatHiveParams {file_columns, hive_partition_columns_to_read_from_file_path.getNameToTypeMap()});
 
     if (query_info.prewhere_info)

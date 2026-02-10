@@ -82,9 +82,16 @@ ReadFromFormatInfo IDataLakeMetadata::prepareReadingFromFormat(
     const StorageSnapshotPtr & storage_snapshot,
     const ContextPtr & context,
     bool supports_subset_of_columns,
-    bool supports_tuple_elements)
+    bool supports_tuple_elements,
+    bool supports_dynamic_subcolumns)
 {
-    return DB::prepareReadingFromFormat(requested_columns, storage_snapshot, context, supports_subset_of_columns, supports_tuple_elements);
+    return DB::prepareReadingFromFormat(
+        requested_columns,
+        storage_snapshot,
+        context,
+        supports_subset_of_columns,
+        supports_tuple_elements,
+        supports_dynamic_subcolumns);
 }
 
 }

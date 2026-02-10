@@ -3,6 +3,9 @@
 #include <Storages/StorageSnapshot.h>
 #include <Storages/IStorage.h>
 #include <Common/quoteString.h>
+#include <Common/logger_useful.h>
+#include <DataTypes/DataTypeObject.h>
+#include <DataTypes/NestedUtils.h>
 
 #include <base/StringViewHash.h>
 #include <sparsehash/dense_hash_set>
@@ -16,6 +19,55 @@ namespace ErrorCodes
     extern const int EMPTY_LIST_OF_COLUMNS_QUERIED;
     extern const int NO_SUCH_COLUMN_IN_TABLE;
     extern const int COLUMN_QUERIED_MORE_THAN_ONCE;
+}
+
+namespace
+{
+LoggerPtr getDynamicSubcolumnLogger()
+{
+    static LoggerPtr logger = getLogger("DynamicSubcolumns");
+    return logger;
+}
+
+std::optional<DataTypePtr> tryGetDynamicSubcolumnType(const ColumnsDescription & columns, const String & column_name)
+{
+    for (const auto & parent_column : columns.getAllPhysical())
+    {
+        const auto & parent_name = parent_column.name;
+        if (!column_name.starts_with(parent_name) || column_name.size() <= parent_name.size() + 1)
+            continue;
+        if (column_name[parent_name.size()] != '.')
+            continue;
+
+        const auto subcolumn_name = std::string_view(column_name).substr(parent_name.size() + 1);
+        const auto & parent_type = parent_column.type;
+        if (!parent_type->hasDynamicSubcolumnsData())
+            continue;
+
+        if (auto subcolumn_type = parent_type->tryGetSubcolumnType(subcolumn_name))
+        {
+            LOG_DEBUG(getDynamicSubcolumnLogger(),
+                "Resolved dynamic subcolumn '{}' under '{}' as type {}",
+                column_name, parent_name, subcolumn_type->getName());
+            return subcolumn_type;
+        }
+
+        if (const auto * object_type = typeid_cast<const DataTypeObject *>(parent_type.get()))
+        {
+            auto fallback = object_type->getDynamicType();
+            LOG_DEBUG(getDynamicSubcolumnLogger(),
+                "Falling back to Dynamic for subcolumn '{}' under '{}' (type {})",
+                column_name, parent_name, fallback->getName());
+            return fallback;
+        }
+
+        LOG_DEBUG(getDynamicSubcolumnLogger(),
+            "Dynamic subcolumn '{}' under '{}' not resolved by type {}",
+            column_name, parent_name, parent_type->getName());
+    }
+
+    return std::nullopt;
+}
 }
 
 StorageSnapshot::StorageSnapshot(
@@ -160,10 +212,14 @@ Block StorageSnapshot::getSampleBlockForColumns(const Names & column_names) cons
     const auto & common_virtual_columns = IStorage::getCommonVirtuals();
     for (const auto & column_name : column_names)
     {
-        auto column = columns.tryGetColumnOrSubcolumn(GetColumnsOptions::All, column_name);
+        auto column = columns.tryGetColumn(GetColumnsOptions(GetColumnsOptions::All).withSubcolumns(), column_name);
         if (column)
         {
             res.insert({column->type->createColumn(), column->type, column_name});
+        }
+        else if (auto dynamic_type = tryGetDynamicSubcolumnType(columns, column_name))
+        {
+            res.insert({(*dynamic_type)->createColumn(), *dynamic_type, column_name});
         }
         else if (auto virtual_column = virtual_columns->tryGet(column_name))
         {
@@ -197,6 +253,14 @@ ColumnsDescription StorageSnapshot::getDescriptionForColumns(const Names & colum
         if (column)
         {
             res.add(*column, "", false, false);
+        }
+        else if (auto column_pair = columns.tryGetColumn(GetColumnsOptions(GetColumnsOptions::All).withSubcolumns(), name))
+        {
+            res.add({column_pair->name, column_pair->type}, "", false, false);
+        }
+        else if (auto dynamic_type = tryGetDynamicSubcolumnType(columns, name))
+        {
+            res.add({name, *dynamic_type}, "", false, false);
         }
         else if (auto virtual_column = virtual_columns->tryGet(name))
         {

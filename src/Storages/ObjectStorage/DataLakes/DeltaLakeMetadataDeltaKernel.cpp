@@ -486,7 +486,8 @@ ReadFromFormatInfo DeltaLakeMetadataDeltaKernel::prepareReadingFromFormat(
     const StorageSnapshotPtr & storage_snapshot,
     const ContextPtr & context,
     bool supports_subset_of_columns,
-    bool /*supports_tuple_elements*/)
+    bool /*supports_tuple_elements*/,
+    bool supports_dynamic_subcolumns)
 {
     /// The below code is similar to what can be found in `prepareReadingFromFormat.cpp`,
     /// but is adjusted for delta-lake.
@@ -543,7 +544,7 @@ ReadFromFormatInfo DeltaLakeMetadataDeltaKernel::prepareReadingFromFormat(
     /// If we have a column `c1.c2` which is an array and have `SELECT c1.c2.size0`,
     /// then in requested_table_columns we will have `c1.c2` as name in storage and `size0` as subcolumn name,
     /// while in columns_to_read we will have `c1` as name in storage and `c2` as subcolumn name.
-    columns_to_read = filterTupleColumnsToRead(info.requested_columns);
+    columns_to_read = filterTupleColumnsToRead(info.requested_columns, supports_dynamic_subcolumns);
 
     auto readable_columns_with_subcolumns = read_columns_desc.get(GetColumnsOptions(GetColumnsOptions::All).withSubcolumns());
     auto readable_columns = read_columns_desc.get(GetColumnsOptions(GetColumnsOptions::All));

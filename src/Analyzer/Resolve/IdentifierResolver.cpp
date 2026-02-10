@@ -55,6 +55,13 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
+static FunctionNodePtr wrapExpressionNodeInSubcolumn(QueryTreeNodePtr expression, std::string subcolumn_name, const ContextPtr & context);
+static FunctionNodePtr wrapExpressionNodeInFunctionWithSecondConstantStringArgument(
+    QueryTreeNodePtr expression,
+    std::string function_name,
+    std::string second_argument,
+    const ContextPtr & context);
+
 QueryTreeNodePtr IdentifierResolver::convertJoinedColumnTypeToNullIfNeeded(
     const QueryTreeNodePtr & resolved_identifier,
     DataTypePtr result_type,
@@ -517,7 +524,7 @@ bool IdentifierResolver::tryBindIdentifierToArrayJoinExpressions(const Identifie
 IdentifierResolveResult IdentifierResolver::tryResolveIdentifierFromStorage(
     const IdentifierLookup & identifier_lookup,
     const QueryTreeNodePtr & table_expression_node,
-    const AnalysisTableExpressionData & table_expression_data,
+    AnalysisTableExpressionData & table_expression_data,
     IdentifierResolveScope & scope,
     size_t identifier_column_qualifier_parts,
     bool can_be_not_found)
@@ -544,8 +551,9 @@ IdentifierResolveResult IdentifierResolver::tryResolveIdentifierFromStorage(
     {
         result_expression = it->second;
     }
+
     /// Check if it's a subcolumn
-    else
+    if (!result_expression)
     {
         if (auto subcolumn_info = table_expression_data.tryGetSubcolumnInfo(identifier_full_name))
         {
@@ -1041,65 +1049,40 @@ IdentifierResolveResult IdentifierResolver::tryResolveIdentifierFromJoin(const I
 
     auto check_nested_column_not_in_using = [&join_using_column_name_to_column_node, &identifier_lookup](const QueryTreeNodePtr & node)
     {
-        /** tldr: When an identifier is resolved into the function `nested` or `getSubcolumn`, and
-          * some column in its argument is in the USING list and its type has to be updated, we throw an error to avoid overcomplication.
-          *
-          * Identifiers can be resolved into functions in case of nested or subcolumns.
-          * For example `t.t.t` can be resolved into `getSubcolumn(t, 't.t')` function in case of `t` is `Tuple`.
-          * So, `t` in USING list is resolved from JOIN itself and has supertype of columns from left and right table.
-          * But `t` in `getSubcolumn` argument is still resolved from table and we need to update its type.
-          *
-          * Example:
-          *
-          * SELECT t.t FROM (
-          *     SELECT ((1, 's'), 's') :: Tuple(t Tuple(t UInt32, s1 String), s1 String) as t
-          * ) AS a FULL JOIN (
-          *     SELECT ((1, 's'), 's') :: Tuple(t Tuple(t Int32, s2 String), s2 String) as t
-          * ) AS b USING t;
-          *
-          * Result type of `t` is `Tuple(Tuple(Int64, String), String)` (different type and no names for subcolumns),
-          * so it may be tricky to have a correct type for `t.t` that is resolved into getSubcolumn(t, 't').
-          *
-          * It can be more complicated in case of Nested subcolumns, in that case in query:
-          *     SELECT t FROM ... JOIN ... USING (t.t)
-          * Here, `t` is resolved into function `nested(['t', 's'], t.t, t.s) so, `t.t` should be from JOIN and `t.s` should be from table.
-          *
-          * Updating type accordingly is pretty complicated, so just forbid such cases.
-          *
-          * While it still may work for storages that support selecting subcolumns directly without `getSubcolumn` function:
-          *     SELECT t, t.t, toTypeName(t), toTypeName(t.t) FROM t1 AS a FULL JOIN t2 AS b USING t.t;
-          * We just support it as a best-effort: `t` will have original type from table, but `t.t` will have super-type from JOIN.
-          * Probably it's good to prohibit such cases as well, but it's not clear how to check it in general case.
+        /** Reject only if an expression inside a subcolumn function references a column from USING.
+          * This keeps the original safety constraint without overfitting to specific function shapes.
           */
         if (node->getNodeType() != QueryTreeNodeType::FUNCTION)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected node type {}, expected function node", node->getNodeType());
 
-        const auto & function_node = node->as<FunctionNode &>();
-        auto is_column_node = [](const auto & argument) { return argument->getNodeType() == QueryTreeNodeType::COLUMN; };
-        if (function_node.getFunctionName() == "firstNonDefault" && std::ranges::all_of(function_node.getArguments().getNodes(), is_column_node))
-            return;
-
-        const auto & function_argument_nodes = function_node.getArguments().getNodes();
-        for (const auto & argument_node : function_argument_nodes)
+        std::function<void(const QueryTreeNodePtr &)> visit;
+        visit = [&](const QueryTreeNodePtr & current)
         {
-            if (argument_node->getNodeType() == QueryTreeNodeType::COLUMN)
+            if (!current)
+                return;
+
+            if (current->getNodeType() == QueryTreeNodeType::COLUMN)
             {
-                const auto & column_name = argument_node->as<ColumnNode &>().getColumnName();
+                const auto & column_name = current->as<ColumnNode &>().getColumnName();
                 if (join_using_column_name_to_column_node.contains(column_name))
                     throw Exception(ErrorCodes::AMBIGUOUS_IDENTIFIER,
                         "Cannot select subcolumn for identifier '{}' while joining using column '{}'",
                             identifier_lookup.identifier, column_name);
+                return;
             }
-            else if (argument_node->getNodeType() == QueryTreeNodeType::CONSTANT)
+
+            if (current->getNodeType() == QueryTreeNodeType::CONSTANT)
+                return;
+
+            if (current->getNodeType() == QueryTreeNodeType::FUNCTION)
             {
-                continue;
+                const auto & function_node = current->as<FunctionNode &>();
+                for (const auto & argument_node : function_node.getArguments().getNodes())
+                    visit(argument_node);
             }
-            else
-            {
-                throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected node type {} for argument node in {}",
-                    argument_node->getNodeType(), node->formatASTForErrorMessage());
-            }
-        }
+        };
+
+        visit(node);
     };
 
     std::optional<JoinTableSide> resolved_side;

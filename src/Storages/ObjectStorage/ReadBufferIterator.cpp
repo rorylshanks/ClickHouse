@@ -89,7 +89,10 @@ std::optional<ColumnsDescription> ReadBufferIterator::tryGetColumnsFromCache(
         {
             const auto cache_key = getKeyForSchemaCache(*object_info, *format);
             if (auto columns = schema_cache.tryGetColumns(cache_key, get_last_mod_time))
+            {
+                current_object_info = object_info;
                 return columns;
+            }
         }
         else
         {
@@ -103,6 +106,7 @@ std::optional<ColumnsDescription> ReadBufferIterator::tryGetColumnsFromCache(
                 {
                     /// Now format is known. It should be the same for all files.
                     format = format_name;
+                    current_object_info = object_info;
                     return columns;
                 }
             }

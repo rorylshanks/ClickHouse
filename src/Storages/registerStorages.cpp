@@ -16,6 +16,7 @@ void registerStorageDistributed(StorageFactory & factory);
 void registerStorageMemory(StorageFactory & factory);
 void registerStorageFile(StorageFactory & factory);
 void registerStorageURL(StorageFactory & factory);
+void registerStorageClickLake(StorageFactory & factory);
 void registerStorageDictionary(StorageFactory & factory);
 void registerStorageSet(StorageFactory & factory);
 void registerStorageJoin(StorageFactory & factory);
@@ -125,6 +126,7 @@ void registerStorages()
     registerStorageMemory(factory);
     registerStorageFile(factory);
     registerStorageURL(factory);
+    registerStorageClickLake(factory);
     registerStorageDictionary(factory);
     registerStorageSet(factory);
     registerStorageJoin(factory);

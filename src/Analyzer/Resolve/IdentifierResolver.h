@@ -107,7 +107,7 @@ private:
     IdentifierResolveResult tryResolveIdentifierFromStorage(
         const IdentifierLookup & identifier_lookup,
         const QueryTreeNodePtr & table_expression_node,
-        const AnalysisTableExpressionData & table_expression_data,
+        AnalysisTableExpressionData & table_expression_data,
         IdentifierResolveScope & scope,
         size_t identifier_column_qualifier_parts,
         bool can_be_not_found = false);

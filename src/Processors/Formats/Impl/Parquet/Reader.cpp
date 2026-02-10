@@ -6,6 +6,7 @@
 #include <Columns/ColumnTuple.h>
 #include <Columns/FilterDescription.h>
 #include <Common/FieldAccurateComparison.h>
+#include <Common/logger_useful.h>
 #include <Formats/FormatFilterInfo.h>
 #include <Interpreters/castColumn.h>
 #include <IO/CompressionMethod.h>
@@ -341,6 +342,53 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
         }
     }
 
+    {
+        std::vector<String> mappings;
+        std::unordered_set<size_t> primitive_idxs;
+        for (size_t idx_in_block = 0; idx_in_block < sample_block->columns(); ++idx_in_block)
+        {
+            const auto & output_idx = sample_block_to_output_columns_idx.at(idx_in_block);
+            if (!output_idx.has_value())
+                continue;
+            const auto & out = output_columns[*output_idx];
+
+            String mapping = out.name + " <- ";
+            bool first = true;
+            for (size_t p = out.primitive_start; p < out.primitive_end; ++p)
+            {
+                if (!first)
+                    mapping += ", ";
+                mapping += primitive_columns[p].name;
+                primitive_idxs.insert(p);
+                first = false;
+            }
+            mappings.push_back(std::move(mapping));
+        }
+
+        String mappings_joined;
+        for (size_t i = 0; i < mappings.size(); ++i)
+        {
+            if (i)
+                mappings_joined += "; ";
+            mappings_joined += mappings[i];
+        }
+
+        String primitive_joined;
+        bool first = true;
+        for (size_t p : primitive_idxs)
+        {
+            if (!first)
+                primitive_joined += ", ";
+            primitive_joined += primitive_columns[p].name;
+            first = false;
+        }
+
+        LOG_DEBUG(&Poco::Logger::get("ParquetReader"),
+            "Parquet column mapping: {}", mappings_joined);
+        LOG_INFO(&Poco::Logger::get("ParquetReader"),
+            "Parquet primitive columns to read ({}): {}", primitive_idxs.size(), primitive_joined);
+    }
+
     if (format_filter_info->key_condition)
     {
         for (size_t idx_in_output_block : format_filter_info->key_condition->getUsedColumns())
@@ -584,6 +632,15 @@ void Reader::initializePrefetches()
             column.use_column_index = primitive_columns[column_idx].column_index_condition
                 && column.offset_index_prefetch
                 && column.meta->__isset.column_index_offset && column.meta->__isset.column_index_length;
+            if (column.use_column_index)
+            {
+                /// If chunk-level min/max are absent, be conservative and avoid page-index pruning
+                /// because page index min/max has been observed to be unreliable in this case.
+                const auto & stats = column.meta->meta_data.statistics;
+                if (!column.meta->meta_data.__isset.statistics ||
+                    !stats.__isset.min_value || !stats.__isset.max_value)
+                    column.use_column_index = false;
+            }
             if (column.use_column_index)
                 column.column_index_prefetch = prefetcher.registerRange(
                     size_t(column.meta->column_index_offset),
@@ -1156,11 +1213,22 @@ void Reader::decodeOffsetIndex(ColumnChunk & column, const RowGroup & row_group)
     }
 }
 
-void Reader::determinePagesToPrefetch(ColumnChunk & column, const RowSubgroup & row_subgroup, const RowGroup & row_group, std::vector<PrefetchHandle *> & out)
+void Reader::determinePagesToPrefetch(
+    ColumnChunk & column,
+    const RowSubgroup & row_subgroup,
+    const RowGroup & row_group,
+    const PrimitiveColumnInfo & column_info,
+    std::vector<PrefetchHandle *> & out)
 {
     chassert(row_subgroup.filter.rows_pass > 0);
     if (column.offset_index.page_locations.empty())
         return; // no offset index, can't prefetch individual pages
+
+    const bool prefetch_all_pages =
+        (column_info.levels.back().rep == 0) &&
+        !row_subgroup.filter.filter.empty() &&
+        column.page.initialized &&
+        !column.page.is_dictionary_encoded;
 
     if (column.data_pages.empty())
     {
@@ -1219,8 +1287,8 @@ void Reader::determinePagesToPrefetch(ColumnChunk & column, const RowSubgroup & 
         size_t start_row_idx = std::max(page_start, row_subgroup.start_row_idx);
         size_t end_row_idx = std::min(page.end_row_idx, subgroup_end);
 
-        bool passes_filter = row_subgroup.filter.rows_pass > 0 && end_row_idx > start_row_idx;
-        if (passes_filter && row_subgroup.filter.rows_pass < row_subgroup.filter.rows_total)
+        bool passes_filter = prefetch_all_pages || (row_subgroup.filter.rows_pass > 0 && end_row_idx > start_row_idx);
+        if (!prefetch_all_pages && passes_filter && row_subgroup.filter.rows_pass < row_subgroup.filter.rows_total)
             passes_filter = !memoryIsZero(row_subgroup.filter.filter.data(), start_row_idx - row_subgroup.start_row_idx, end_row_idx - row_subgroup.start_row_idx);
 
         if (passes_filter)
@@ -1418,8 +1486,16 @@ void Reader::decodePrimitiveColumn(ColumnChunk & column, const PrimitiveColumnIn
     {
         const auto & null_map = assert_cast<const ColumnUInt8 &>(*subchunk.null_map).getData();
         if (memchr(null_map.data(), 0, null_map.size()) != nullptr)
-            throw Exception(ErrorCodes::CANNOT_INSERT_NULL_IN_ORDINARY_COLUMN, "Cannot convert NULL value to non-Nullable type for column {}", column_info.name);
-        subchunk.null_map = nullptr;
+        {
+            throw Exception(
+                ErrorCodes::CANNOT_INSERT_NULL_IN_ORDINARY_COLUMN,
+                "Cannot convert NULL value to non-Nullable type for column {}",
+                column_info.name);
+        }
+        else
+        {
+            subchunk.null_map = nullptr;
+        }
     }
 
     if (subchunk.null_map)
@@ -2026,6 +2102,109 @@ MutableColumnPtr Reader::formOutputColumn(RowSubgroup & row_subgroup, size_t out
     const OutputColumnInfo & output_info = output_columns.at(output_column_idx);
     MutableColumnPtr res;
 
+    if (output_info.base_output_idx.has_value())
+    {
+        const auto base_idx = output_info.base_output_idx.value();
+        LOG_TRACE(&Poco::Logger::get("ParquetReader"),
+            "formOutputColumn: output_column_idx={}, base_idx={}, subcolumn_name='{}', output_name='{}', num_rows={}",
+            output_column_idx, base_idx, output_info.subcolumn_name, output_info.name, num_rows);
+
+        /// Check if the base column is already cached.
+        ColumnPtr base_column;
+        {
+            std::lock_guard cache_lock(row_subgroup.formed_output_columns_cache_mutex);
+            auto cache_it = row_subgroup.formed_output_columns_cache.find(base_idx);
+            if (cache_it != row_subgroup.formed_output_columns_cache.end() && cache_it->second)
+            {
+                LOG_TRACE(&Poco::Logger::get("ParquetReader"),
+                    "formOutputColumn: Using cached base column for base_idx={}", base_idx);
+                base_column = cache_it->second->getPtr();
+            }
+        }
+
+        if (!base_column)
+        {
+            auto formed = formOutputColumn(row_subgroup, base_idx, num_rows);
+            LOG_TRACE(&Poco::Logger::get("ParquetReader"),
+                "formOutputColumn: AFTER formOutputColumn for base_idx={}", base_idx);
+            if (formed)
+            {
+                std::lock_guard cache_lock(row_subgroup.formed_output_columns_cache_mutex);
+                auto [it, inserted] = row_subgroup.formed_output_columns_cache.try_emplace(base_idx, nullptr);
+                if (!it->second)
+                    it->second = std::move(formed);
+                if (it->second)
+                    base_column = it->second->getPtr();
+            }
+        }
+
+        if (!base_column)
+        {
+            LOG_TRACE(&Poco::Logger::get("ParquetReader"),
+                "formOutputColumn: base_column is NULL!");
+            res = output_info.output_type->createColumn();
+            res->insertManyDefaults(num_rows);
+            return res;
+        }
+        const auto & base_type = output_columns.at(base_idx).output_type;
+        if (!base_type)
+        {
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "Parquet Reader failed to form subcolumn '{}': base output type is NULL for base_output_idx={}",
+                output_info.name,
+                output_info.base_output_idx ? std::to_string(*output_info.base_output_idx) : "none");
+        }
+        LOG_TRACE(&Poco::Logger::get("ParquetReader"),
+            "formOutputColumn: base_column size={}, base_type={}, base_column type={}",
+            base_column->size(), base_type->getName(), base_column->getName());
+        LOG_TRACE(&Poco::Logger::get("ParquetReader"),
+            "formOutputColumn: BEFORE tryGetSubcolumn, subcolumn_name='{}'", output_info.subcolumn_name);
+        ColumnPtr subcolumn;
+        try {
+            subcolumn = base_type->tryGetSubcolumn(output_info.subcolumn_name, base_column);
+        } catch (const std::exception & e) {
+            LOG_TRACE(&Poco::Logger::get("ParquetReader"),
+                "formOutputColumn: tryGetSubcolumn EXCEPTION: {}", e.what());
+            throw;
+        }
+        LOG_TRACE(&Poco::Logger::get("ParquetReader"),
+            "formOutputColumn: AFTER tryGetSubcolumn, subcolumn is null={}", subcolumn == nullptr);
+        if (!subcolumn)
+        {
+            res = output_info.output_type->createColumn();
+            res->insertManyDefaults(num_rows);
+        }
+        else
+        {
+            LOG_TRACE(&Poco::Logger::get("ParquetReader"),
+                "formOutputColumn: subcolumn size={}", subcolumn->size());
+            res = IColumn::mutate(std::move(subcolumn));
+            if (output_info.needs_cast)
+            {
+                if (!output_info.input_type || !output_info.output_type)
+                {
+                    throw Exception(
+                        ErrorCodes::LOGICAL_ERROR,
+                        "Parquet Reader cast failed for subcolumn '{}': input_type={}, output_type={}, base_output_idx={}, base_type={}, base_column_type={}",
+                        output_info.name,
+                        output_info.input_type ? output_info.input_type->getName() : "NULL",
+                        output_info.output_type ? output_info.output_type->getName() : "NULL",
+                        output_info.base_output_idx ? std::to_string(*output_info.base_output_idx) : "none",
+                        base_type ? base_type->getName() : "NULL",
+                        base_column ? base_column->getName() : "NULL");
+                }
+                LOG_TRACE(&Poco::Logger::get("ParquetReader"),
+                    "formOutputColumn: BEFORE castColumn");
+                auto casted = castColumn({res->getPtr(), output_info.input_type, output_info.name}, output_info.output_type);
+                res = IColumn::mutate(std::move(casted));
+                LOG_TRACE(&Poco::Logger::get("ParquetReader"),
+                    "formOutputColumn: AFTER castColumn");
+            }
+        }
+        return res;
+    }
+
     if (output_info.is_missing_column)
     {
         res = output_info.output_type->createColumn();
@@ -2050,6 +2229,19 @@ MutableColumnPtr Reader::formOutputColumn(RowSubgroup & row_subgroup, size_t out
         chassert(output_info.primitive_start + 1 == output_info.primitive_end);
         size_t primitive_idx = output_info.primitive_start;
         ColumnSubchunk & subchunk = row_subgroup.columns.at(primitive_idx);
+        if (!subchunk.column)
+        {
+            if (num_rows == 0 && output_info.input_type)
+                return output_info.input_type->createColumn();
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "Parquet Reader failed to form primitive column '{}': subchunk column is NULL, primitive_idx={}, rows_pass={}, input_type={}, output_type={}",
+                output_info.name,
+                primitive_idx,
+                row_subgroup.filter.rows_pass,
+                output_info.input_type ? output_info.input_type->getName() : "NULL",
+                output_info.output_type ? output_info.output_type->getName() : "NULL");
+        }
         res = std::move(subchunk.column);
 
         if (output_info.idx_in_output_block.has_value() &&
@@ -2102,12 +2294,98 @@ MutableColumnPtr Reader::formOutputColumn(RowSubgroup & row_subgroup, size_t out
         res = ColumnMap::create(std::move(nested));
     }
 
+    if (!output_info.input_type)
+    {
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "Parquet Reader failed to finalize column '{}': input_type is NULL, is_missing_column={}, is_primitive={}, primitive_range=[{},{}), base_output_idx={}, subcolumn_name={}",
+            output_info.name,
+            output_info.is_missing_column ? "true" : "false",
+            output_info.is_primitive ? "true" : "false",
+            output_info.primitive_start,
+            output_info.primitive_end,
+            output_info.base_output_idx ? std::to_string(*output_info.base_output_idx) : "none",
+            output_info.subcolumn_name.empty() ? "none" : output_info.subcolumn_name);
+    }
+    if (!res)
+    {
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "Parquet Reader failed to finalize column '{}': result column is NULL",
+            output_info.name);
+    }
     chassert(res->getDataType() == output_info.input_type->getColumnType());
 
     if (output_info.needs_cast)
     {
+        if (!output_info.input_type || !output_info.output_type)
+        {
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "Parquet Reader cast failed for column '{}': input_type={}, output_type={}, is_missing_column={}, is_primitive={}, primitive_range=[{},{}), base_output_idx={}, subcolumn_name={}",
+                output_info.name,
+                output_info.input_type ? output_info.input_type->getName() : "NULL",
+                output_info.output_type ? output_info.output_type->getName() : "NULL",
+                output_info.is_missing_column ? "true" : "false",
+                output_info.is_primitive ? "true" : "false",
+                output_info.primitive_start,
+                output_info.primitive_end,
+                output_info.base_output_idx ? std::to_string(*output_info.base_output_idx) : "none",
+                output_info.subcolumn_name.empty() ? "none" : output_info.subcolumn_name);
+        }
+        DataTypePtr cast_input_type = output_info.input_type;
+        ColumnPtr cast_column = res->getPtr();
+        if (output_info.is_json_bucket_column && cast_input_type->isNullable())
+        {
+            /// JSON bucket columns store serialized JSON as String. When the column is Nullable,
+            /// we replace NULLs with empty JSON objects `{}` so the bucket can be processed
+            /// as non-nullable. This is semantically correct because NULL in a JSON bucket
+            /// means "no data", which is equivalent to an empty object `{}`.
+            if (auto * nullable_col = typeid_cast<ColumnNullable *>(res.get()))
+            {
+                const auto & null_map = nullable_col->getNullMapData();
+                if (auto * nested_str = typeid_cast<const ColumnString *>(nullable_col->getNestedColumnPtr().get()))
+                {
+                    auto filled = ColumnString::create();
+                    filled->reserve(nullable_col->size());
+
+                    constexpr std::string_view empty_object = "{}";
+                    for (size_t i = 0; i < null_map.size(); ++i)
+                    {
+                        if (!null_map[i])
+                        {
+                            /// In ColumnNullable, nested column has the same size as null_map,
+                            /// with each position corresponding directly to the same index.
+                            auto ref = nested_str->getDataAt(i);
+                            /// Empty strings are also replaced with `{}` since an empty string
+                            /// is not valid JSON, whereas `{}` is a valid empty JSON object.
+                            if (ref.size())
+                                filled->insertData(ref.data(), ref.size());
+                            else
+                                filled->insertData(empty_object.data(), empty_object.size());
+                        }
+                        else
+                        {
+                            filled->insertData(empty_object.data(), empty_object.size());
+                        }
+                    }
+
+                    cast_column = std::move(filled);
+                    cast_input_type = std::make_shared<DataTypeString>();
+                }
+                else
+                {
+                    throw Exception(
+                        ErrorCodes::LOGICAL_ERROR,
+                        "JSON bucket column '{}' has unexpected nested type: expected String, got {}",
+                        output_info.name,
+                        nullable_col->getNestedColumnPtr()->getName());
+                }
+            }
+        }
+
         auto col = castColumn(
-            {std::move(res), output_info.input_type, output_info.name}, output_info.output_type);
+            {std::move(cast_column), cast_input_type, output_info.name}, output_info.output_type);
         chassert(col->use_count() == 1);
         res = IColumn::mutate(std::move(col));
     }

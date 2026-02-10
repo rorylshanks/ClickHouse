@@ -195,6 +195,9 @@ When reading Parquet files, skip whole row groups based on the WHERE expressions
     DECLARE(Bool, input_format_parquet_enable_json_parsing, true, R"(
 When reading Parquet files, parse JSON columns as ClickHouse JSON Column.
 )", 0) \
+    DECLARE(Bool, input_format_parquet_enable_materialized_json_subcolumns, false, R"(
+Enable resolving JSON subcolumns in Parquet from materialized columns or bucketed JSON columns.
+)", 0) \
     DECLARE(Bool, input_format_parquet_use_native_reader_v3, true, R"(
 Use Parquet reader v3.
 )", 0) \

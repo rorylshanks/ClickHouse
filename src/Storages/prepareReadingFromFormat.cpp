@@ -30,6 +30,7 @@ ReadFromFormatInfo prepareReadingFromFormat(
     const ContextPtr & context,
     bool supports_subset_of_columns,
     bool supports_tuple_elements,
+    bool supports_dynamic_subcolumns,
     const PrepareReadingFromFormatHiveParams & hive_parameters)
 {
     const NamesAndTypesList & columns_in_data_file =
@@ -69,10 +70,13 @@ ReadFromFormatInfo prepareReadingFromFormat(
     if (supports_subset_of_columns)
     {
         if (supports_tuple_elements)
+            columns_to_read = filterTupleColumnsToRead(info.requested_columns, supports_dynamic_subcolumns);
+        else if (columns_to_read.empty())
         {
-            columns_to_read = filterTupleColumnsToRead(info.requested_columns);
+            /// If only virtual columns were requested, just read the smallest column.
+            columns_to_read.push_back(ExpressionActions::getSmallestColumn(columns_in_data_file).name);
         }
-        else if (!columns_to_read.empty())
+        else
         {
             /// We need to replace all subcolumns with their nested columns (e.g `a.b`, `a.b.c`, `x.y` -> `a`, `x`),
             /// because most formats cannot extract subcolumns on their own.
@@ -120,7 +124,7 @@ ReadFromFormatInfo prepareReadingFromFormat(
     return info;
 }
 
-Names filterTupleColumnsToRead(NamesAndTypesList & requested_columns)
+Names filterTupleColumnsToRead(NamesAndTypesList & requested_columns, bool supports_dynamic_subcolumns)
 {
     /// Format can read tuple element subcolumns, e.g. `t.x` or `t.a.x`.
     /// But we still need to do some processing on the set of requested columns:
@@ -208,6 +212,11 @@ Names filterTupleColumnsToRead(NamesAndTypesList & requested_columns)
         }
 
         column_info.name = column_to_read.getNameInStorage();
+        if (supports_dynamic_subcolumns && column_to_read.isSubcolumn() && column_info.path.empty())
+        {
+            column_info.name = column_to_read.name;
+            column_info.type = column_to_read.type;
+        }
         if (!column_info.path.empty())
         {
             column_info.name += '.';
@@ -248,7 +257,10 @@ Names filterTupleColumnsToRead(NamesAndTypesList & requested_columns)
         if (ancestor_requested)
             continue;
 
-        column_to_read.setDelimiterAndTypeInStorage(column_info.name, column_info.type);
+        if (supports_dynamic_subcolumns && column_to_read.isSubcolumn() && column_info.path.empty())
+            column_to_read.setDelimiterAndTypeInStorage(column_to_read.name, column_to_read.type);
+        else
+            column_to_read.setDelimiterAndTypeInStorage(column_info.name, column_info.type);
         if (!column_info.is_duplicate)
             new_columns_to_read.push_back(column_info.name);
     }
