@@ -760,7 +760,7 @@ std::optional<const ColumnDescription> ColumnsDescription::tryGetColumnDescripti
         if (jt != subcolumns.get<0>().end() && (defaultKindToGetKind(columns.get<1>().find(jt->getNameInStorage())->default_desc.kind) & options.kind))
             return ColumnDescription{jt->name, jt->type};
 
-        if (auto dynamic_subcolumn = tryGetDynamicSubcolumn(column_name))
+        if (auto dynamic_subcolumn = tryGetDynamicSubcolumn(column_name, options))
             return ColumnDescription{dynamic_subcolumn->name, dynamic_subcolumn->type};
     }
 

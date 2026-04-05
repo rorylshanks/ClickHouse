@@ -129,15 +129,13 @@ Poco::JSON::Object::Ptr astToJSON(const ASTPtr & ast)
     {
         node->set("value_type", String(literal->value.getTypeName()));
         node->set("value_text", applyVisitor(FieldVisitorToString(), literal->value));
-        if (literal->custom_type)
-            node->set("custom_type", literal->custom_type->getName());
     }
     else if (const auto * function = ast->as<ASTFunction>())
     {
         node->set("name", function->name);
-        node->set("is_operator", function->is_operator);
-        node->set("is_window_function", function->is_window_function);
-        node->set("is_lambda_function", function->is_lambda_function);
+        node->set("is_operator", function->isOperator());
+        node->set("is_window_function", function->isWindowFunction());
+        node->set("is_lambda_function", function->isLambdaFunction());
 
         if (function->arguments)
         {
@@ -315,20 +313,47 @@ StorageClickLake::QueryResponse StorageClickLake::parseQueryResponse(const Strin
             const auto files_size = static_cast<unsigned int>(files_array->size());
             for (unsigned int i = 0; i < files_size; ++i)
             {
-                auto file_obj = files_array->getObject(i);
                 QueryFile file;
-                if (file_obj->has("url"))
-                    file.url = file_obj->getValue<String>("url");
-                if (file_obj->has("key"))
-                    file.key = file_obj->getValue<String>("key");
-                if (file_obj->has("version_id"))
-                    file.version_id = file_obj->getValue<String>("version_id");
-                if (file_obj->has("etag"))
-                    file.etag = file_obj->getValue<String>("etag");
-                if (file_obj->has("size"))
-                    file.size = file_obj->getValue<UInt64>("size");
-                if (file_obj->has("last_modified"))
-                    file.last_modified = file_obj->getValue<UInt64>("last_modified");
+
+                /// Support both object entries and plain string entries for compatibility.
+                if (files_array->isObject(i))
+                {
+                    auto file_obj = files_array->getObject(i);
+                    if (file_obj->has("url"))
+                        file.url = file_obj->getValue<String>("url");
+                    if (file_obj->has("etag"))
+                        file.etag = file_obj->getValue<String>("etag");
+                    if (file_obj->has("size"))
+                        file.size = file_obj->getValue<UInt64>("size");
+                    if (file_obj->has("last_modified"))
+                        file.last_modified = file_obj->getValue<UInt64>("last_modified");
+                }
+                else
+                {
+                    try
+                    {
+                        file.url = files_array->getElement<String>(i);
+                    }
+                    catch (const Poco::Exception &)
+                    {
+                        throw Exception(
+                            ErrorCodes::RECEIVED_ERROR_FROM_REMOTE_IO_SERVER,
+                            "Invalid `files` entry at index {}: expected object or string", i);
+                    }
+                }
+
+                response.files.push_back(std::move(file));
+            }
+        }
+        else if (root->has("urls"))
+        {
+            /// Backward compatibility with older ClickLake server responses.
+            auto urls_array = root->getArray("urls");
+            const auto urls_size = static_cast<unsigned int>(urls_array->size());
+            for (unsigned int i = 0; i < urls_size; ++i)
+            {
+                QueryFile file;
+                file.url = urls_array->getElement<String>(i);
                 response.files.push_back(std::move(file));
             }
         }
@@ -973,6 +998,12 @@ void ReadFromClickLake::initializePipeline(QueryPipelineBuilder & pipeline, cons
     {
         try
         {
+            if (file.url.empty())
+            {
+                error = "ClickLake file entry has empty url";
+                return;
+            }
+
             auto s3_uri = tryParseS3URI(file.url, local_context);
             ClickLakeS3GroupKey key{.endpoint = s3_uri->endpoint, .bucket = s3_uri->bucket};
             auto it = s3_groups->find(key);
@@ -1008,12 +1039,9 @@ void ReadFromClickLake::initializePipeline(QueryPipelineBuilder & pipeline, cons
                 metadata = std::move(object_metadata);
             }
 
-            std::optional<String> version_id = s3_uri->version_id;
-            if (version_id == std::nullopt && !file.version_id.empty())
-                version_id = file.version_id;
-
-            RelativePathWithMetadata path_with_metadata{s3_uri->key, metadata, version_id};
-            state->pending_s3[key].emplace_back(path_with_metadata, version_id);
+            /// Key/version are sourced from URL only.
+            RelativePathWithMetadata path_with_metadata{s3_uri->key, metadata, s3_uri->version_id};
+            state->pending_s3[key].emplace_back(path_with_metadata, s3_uri->version_id);
             return;
         }
         catch (const Exception & e)
@@ -1179,7 +1207,7 @@ void ReadFromClickLake::initializePipeline(QueryPipelineBuilder & pipeline, cons
             configuration->markInitialized();
 
             group.configuration = configuration;
-            group.object_storage = configuration->createObjectStorage(local_context, /*is_readonly*/ false);
+            group.object_storage = configuration->createObjectStorage(local_context, /*is_readonly*/ false, std::nullopt);
 
             auto iterator = std::make_shared<ClickLakeS3Iterator>(state, key);
 

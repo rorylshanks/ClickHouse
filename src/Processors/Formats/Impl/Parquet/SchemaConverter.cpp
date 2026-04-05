@@ -172,7 +172,7 @@ void SchemaConverter::prepareDynamicSubcolumnRequests()
     for (size_t i = 0; i < top_level_columns; ++i)
     {
         const auto & element = file_metadata.schema.at(schema_pos);
-        const String mapped_name = String(useColumnMapperIfNeeded(element));
+        const String mapped_name = String(useColumnMapperIfNeeded(element, ""));
         file_columns.insert(normalizeColumnName(mapped_name, case_insensitive));
 
         const String normalized_name = normalizeColumnName(mapped_name, case_insensitive);

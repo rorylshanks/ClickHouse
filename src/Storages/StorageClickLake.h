@@ -68,7 +68,7 @@ public:
     void alter(const AlterCommands & commands, ContextPtr context, AlterLockHolder & alter_lock_holder) override;
 
     bool supportsSubcolumns() const override { return true; }
-    bool supportsDynamicSubcolumns() const override { return true; }
+    bool supportsDynamicSubcolumns() const { return true; }
     bool supportsParallelInsert() const override { return true; }
     bool prefersLargeBlocks() const override { return true; }
     bool supportsPrewhere() const override;
@@ -80,8 +80,6 @@ public:
     struct QueryFile
     {
         String url;
-        String key;
-        String version_id;
         String etag;
         UInt64 size = 0;
         UInt64 last_modified = 0; /// Unix timestamp (seconds)
