@@ -121,9 +121,7 @@ ParquetBlockOutputFormat::ParquetBlockOutputFormat(WriteBuffer & out_, SharedHea
         options.use_dictionary_encoding = options.max_dictionary_size > 0;
 
         if (format_filter_info_ && format_filter_info_->column_mapper)
-            schema = convertSchema(*header_, options, format_filter_info_->column_mapper->getStorageColumnEncoding());
-        else
-            schema = convertSchema(*header_, options, std::nullopt);
+            column_field_ids = format_filter_info_->column_mapper->getStorageColumnEncoding();
     }
 }
 
@@ -249,6 +247,14 @@ void ParquetBlockOutputFormat::finalizeImpl()
 
         if (file_state.offset == 0)
         {
+            Block header = materializeBlock(getPort(PortKind::Main).getHeader());
+            if (schema.empty())
+            {
+                if (column_field_ids)
+                    schema = convertSchema(header, options, *column_field_ids);
+                else
+                    schema = convertSchema(header, options, std::nullopt);
+            }
             base_offset = out.count();
             writeFileHeader(file_state, out);
         }
@@ -288,6 +294,9 @@ void ParquetBlockOutputFormat::resetFormatterImpl()
     threads_running = 0;
     task_queue.clear();
     row_groups.clear();
+    schema.clear();
+    variant_type_hints.clear();
+    prepared_first_row_group_columns.clear();
     file_state = {};
     file_writer.reset();
     staging_chunks.clear();
@@ -399,12 +408,32 @@ void ParquetBlockOutputFormat::writeRowGroupInOneThread(Chunk chunk)
         return;
 
     const Block & header = getPort(PortKind::Main).getHeader();
+    if (schema.empty())
+        initializeSchemaForCustomEncoder(chunk.getColumns());
+
     Parquet::ColumnChunkWriteStates columns_to_write;
-    chassert(header.columns() == chunk.getNumColumns());
-    for (size_t i = 0; i < header.columns(); ++i)
-        prepareColumnForWrite(
-            chunk.getColumns()[i], header.getByPosition(i).type, header.getByPosition(i).name,
-            options, &columns_to_write);
+    if (!prepared_first_row_group_columns.empty())
+    {
+        auto first_row_group_columns = std::move(prepared_first_row_group_columns);
+        prepared_first_row_group_columns.clear();
+        chassert(first_row_group_columns.size() == header.columns());
+        size_t total_subcolumns = 0;
+        for (const auto & prepared : first_row_group_columns)
+            total_subcolumns += prepared.size();
+        columns_to_write.reserve(total_subcolumns);
+
+        for (auto & prepared : first_row_group_columns)
+            for (auto & state : prepared)
+                columns_to_write.emplace_back(std::move(state));
+    }
+    else
+    {
+        chassert(header.columns() == chunk.getNumColumns());
+        for (size_t i = 0; i < header.columns(); ++i)
+            prepareColumnForWrite(
+                chunk.getColumns()[i], header.getByPosition(i).type, header.getByPosition(i).name,
+                options, format_settings, &columns_to_write, nullptr, column_field_ids, &variant_type_hints, nullptr);
+    }
 
     if (file_state.offset == 0)
     {
@@ -428,7 +457,7 @@ void ParquetBlockOutputFormat::writeRowGroupInParallel(std::vector<Chunk> chunks
 
     RowGroupState & r = row_groups.emplace_back();
     r.column_chunks.resize(header.columns());
-    r.tasks_in_flight = r.column_chunks.size();
+    r.tasks_in_flight = 0;
 
     std::vector<Columns> columnses;
     for (auto & chunk : chunks)
@@ -438,21 +467,62 @@ void ParquetBlockOutputFormat::writeRowGroupInParallel(std::vector<Chunk> chunks
         columnses.push_back(chunk.detachColumns());
     }
 
-    for (size_t i = 0; i < header.columns(); ++i)
+    if (schema.empty())
     {
-        Task & t = task_queue.emplace_back(&r, i, this);
-        t.column_type = header.getByPosition(i).type;
-        t.column_name = header.getByPosition(i).name;
+        Columns concatenated_columns;
+        concatenated_columns.reserve(header.columns());
 
-        /// Defer concatenating the columns to the threads.
-        size_t bytes = 0;
-        for (size_t j = 0; j < chunks.size(); ++j)
+        for (size_t i = 0; i < header.columns(); ++i)
         {
-            auto & col = columnses[j][i];
-            bytes += col->allocatedBytes();
-            t.column_pieces.push_back(std::move(col));
+            IColumn::MutablePtr concatenated = IColumn::mutate(columnses[0][i]->cloneEmpty());
+            for (auto & columns : columnses)
+                concatenated->insertRangeFrom(*columns[i], 0, columns[i]->size());
+            concatenated_columns.push_back(std::move(concatenated));
         }
-        t.mem.set(bytes);
+
+        initializeSchemaForCustomEncoder(concatenated_columns);
+    }
+
+    if (!prepared_first_row_group_columns.empty())
+    {
+        auto first_row_group_columns = std::move(prepared_first_row_group_columns);
+        prepared_first_row_group_columns.clear();
+        chassert(first_row_group_columns.size() == header.columns());
+        for (size_t i = 0; i < header.columns(); ++i)
+        {
+            auto & prepared = first_row_group_columns[i];
+            r.column_chunks[i].reserve(prepared.size());
+            for (auto & state : prepared)
+            {
+                r.column_chunks[i].emplace_back(this);
+                ++r.tasks_in_flight;
+
+                auto & t = task_queue.emplace_back(&r, i, this);
+                t.subcolumn_idx = r.column_chunks[i].size() - 1;
+                t.state = std::move(state);
+                t.mem.set(t.state.allocatedBytes());
+            }
+        }
+    }
+    else
+    {
+        for (size_t i = 0; i < header.columns(); ++i)
+        {
+            Task & t = task_queue.emplace_back(&r, i, this);
+            t.column_type = header.getByPosition(i).type;
+            t.column_name = header.getByPosition(i).name;
+
+            /// Defer concatenating the columns to the threads.
+            size_t bytes = 0;
+            for (size_t j = 0; j < chunks.size(); ++j)
+            {
+                auto & col = columnses[j][i];
+                bytes += col->allocatedBytes();
+                t.column_pieces.push_back(std::move(col));
+            }
+            t.mem.set(bytes);
+            ++r.tasks_in_flight;
+        }
     }
 
     startMoreThreadsIfNeeded(lock);
@@ -562,7 +632,7 @@ void ParquetBlockOutputFormat::threadFunction()
 
             std::vector<ColumnChunkWriteState> subcolumns;
             prepareColumnForWrite(
-                std::move(concatenated), task.column_type, task.column_name, options, &subcolumns);
+                std::move(concatenated), task.column_type, task.column_name, options, format_settings, &subcolumns, nullptr, column_field_ids, &variant_type_hints, nullptr);
 
             lock.lock();
 
@@ -600,6 +670,35 @@ void ParquetBlockOutputFormat::threadFunction()
         --task.row_group->tasks_in_flight;
 
         condvar.notify_all();
+    }
+}
+
+void ParquetBlockOutputFormat::initializeSchemaForCustomEncoder(const Columns & columns)
+{
+    const Block & header = getPort(PortKind::Main).getHeader();
+    chassert(header.columns() == columns.size());
+    schema.clear();
+    variant_type_hints.clear();
+    prepared_first_row_group_columns.clear();
+    prepared_first_row_group_columns.resize(header.columns());
+
+    auto & root = schema.emplace_back();
+    root.__set_name("schema");
+    root.__set_num_children(static_cast<Int32>(header.columns()));
+
+    for (size_t i = 0; i < header.columns(); ++i)
+    {
+        prepareColumnForWrite(
+            columns[i],
+            header.getByPosition(i).type,
+            header.getByPosition(i).name,
+            options,
+            format_settings,
+            &prepared_first_row_group_columns[i],
+            &schema,
+            column_field_ids,
+            &variant_type_hints,
+            &variant_type_hints);
     }
 }
 

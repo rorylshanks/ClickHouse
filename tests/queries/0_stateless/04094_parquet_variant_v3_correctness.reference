@@ -1,0 +1,13 @@
+1	Dynamic	Tuple(typed_value Int64, value Int64)	{"typed_value":2,"value":1}
+2	Dynamic	Tuple(nested Tuple(typed_value Int64, value Int64), tag String)	{"nested":{"typed_value":4,"value":3},"tag":"ok"}
+3	Dynamic	Array(Dynamic)	[1,"x"]
+4	Dynamic	String	"plain string"
+5	Dynamic	None	\N
+1	{"typed_value":2,"value":1}
+2	{"nested":{"typed_value":4,"value":3},"tag":"ok"}
+3	[1,"x"]
+4	"plain string"
+5	null
+1	1	NULL
+2	0	{"a":10}
+3	0	{"typed_value":11,"value":10}

@@ -1,0 +1,9 @@
+id	id	INT64	Int(bitWidth=64, isSigned=false)
+metadata	v.metadata	BYTE_ARRAY	String
+value	v.value	BYTE_ARRAY	String
+1	Int64	1
+2	String	"x"
+3	Int64	2
+4	String	"y"
+1	300
+2	300

@@ -1,0 +1,23 @@
+typed_value	var.typed_value.d.typed_value	INT32	Date
+value	var.typed_value.d.value	BYTE_ARRAY	String
+typed_value	var.typed_value.d32.typed_value	INT32	Date
+value	var.typed_value.d32.value	BYTE_ARRAY	String
+typed_value	var.typed_value.dec.typed_value	FIXED_LEN_BYTE_ARRAY	Decimal(precision=18, scale=3)
+value	var.typed_value.dec.value	BYTE_ARRAY	String
+typed_value	var.typed_value.dt.typed_value	INT64	Timestamp(isAdjustedToUTC=true, timeUnit=milliseconds, is_from_converted_type=false, force_set_converted_type=false)
+value	var.typed_value.dt.value	BYTE_ARRAY	String
+typed_value	var.typed_value.dt64.typed_value	INT64	Timestamp(isAdjustedToUTC=true, timeUnit=microseconds, is_from_converted_type=false, force_set_converted_type=false)
+value	var.typed_value.dt64.value	BYTE_ARRAY	String
+typed_value	var.typed_value.tm.typed_value	BYTE_ARRAY	String
+value	var.typed_value.tm.value	BYTE_ARRAY	String
+typed_value	var.typed_value.tm64.typed_value	BYTE_ARRAY	String
+value	var.typed_value.tm64.value	BYTE_ARRAY	String
+typed_value	var.typed_value.uuid.typed_value	FIXED_LEN_BYTE_ARRAY	UUID
+value	var.typed_value.uuid.value	BYTE_ARRAY	String
+1	{"d":"2024-01-02","d32":"1901-01-02 00:00:00.000000000","dec":123.456,"dt":"2024-01-02 03:04:05.000000000","dt64":"2024-01-02 03:04:05.123456000","tm":"01:02:03","tm64":"04:05:06.1234567","uuid":"550e8400-e29b-41d4-a716-446655440000"}
+id	id	INT64	Int(bitWidth=64, isSigned=false)
+metadata	v.metadata	BYTE_ARRAY	String
+value	v.value	BYTE_ARRAY	String
+1	Date	"2024-01-02"
+2	DateTime64(9)	"2024-01-02 03:04:05.123456000"
+3	String	"04:05:06.1234567"

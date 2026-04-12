@@ -117,6 +117,7 @@ private:
     void writeUsingArrow(std::vector<Chunk> chunks);
     void writeRowGroupInOneThread(Chunk chunk);
     void writeRowGroupInParallel(std::vector<Chunk> chunks);
+    void initializeSchemaForCustomEncoder(const Columns & columns);
 
     void threadFunction();
     void startMoreThreadsIfNeeded(const std::unique_lock<std::mutex> & lock);
@@ -136,6 +137,9 @@ private:
 
     Parquet::WriteOptions options;
     Parquet::SchemaElements schema;
+    Parquet::VariantWriteTypeHints variant_type_hints;
+    std::vector<Parquet::ColumnChunkWriteStates> prepared_first_row_group_columns;
+    std::optional<std::unordered_map<String, Int64>> column_field_ids;
     Parquet::FileWriteState file_state;
     size_t base_offset = 0; // initial out.count(), just for assert
 

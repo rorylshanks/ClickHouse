@@ -1,0 +1,20 @@
+id	id	INT64	Int(bitWidth=64, isSigned=false)
+metadata	v.metadata	BYTE_ARRAY	String
+value	v.value	BYTE_ARRAY	String
+1	Int64	1
+2	Int64	-5
+3	Int64	-300
+4	Int64	-70000
+5	Int64	-5000000000
+6	Float64	1.5
+7	Float64	-2.75
+8	String	"hello"
+9	Decimal(9, 2)	12.34
+10	Decimal(18, 3)	-56.789
+11	Decimal(38, 4)	1234567890123.4567
+12	UUID	"550e8400-e29b-41d4-a716-446655440000"
+13	String	"203.0.113.42"
+14	String	"2001:db8::1"
+15	Date	"2024-01-02"
+16	DateTime64(9)	"2024-01-02 03:04:05.123456000"
+17	String	"04:05:06.1234567"

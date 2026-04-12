@@ -57,15 +57,14 @@ namespace DB
 
     /// Get all needed information for reading from data in some input format.
     ///
-    /// `supports_tuple_elements` controls how tuple element access is handled, e.g. "t.x".
-    /// If true, we'll request "t.x" from the format, expecting it to interpret the dot correctly.
-    /// If false, we'll ask the format to read the whole tuple "t"; then the needed subcolumns are
-    /// extracted by ExtractColumnsTransform later in the pipeline.
-    /// For subcolumns that are not tuple elements (e.g. dynamic subcolumns "json_column.some_map_key"
-    /// or special subcolumns like "nullable.null" for null map), we request the whole column either way.
-    /// Note: currently `supports_tuple_elements` just means ParquetV3BlockInputFormat; if in future
-    /// we add support for other subcolumn types in ParquetV3BlockInputFormat, we can just rename
-    /// this bool instead of adding another one.
+    /// `supports_tuple_elements` controls how subcolumn access is handled, e.g. `t.x`.
+    /// If true, we'll request supported subcolumns directly from the format, expecting it to
+    /// interpret the dot correctly. Today this includes tuple elements and fixed subcolumns of
+    /// `JSON` / `Dynamic` columns in `ParquetV3BlockInputFormat`.
+    /// If false, or if the subcolumn kind is not supported by the format, we'll ask the format to
+    /// read the whole parent column; then the needed subcolumns are extracted by
+    /// `ExtractColumnsTransform` later in the pipeline.
+    /// Special subcolumns like `nullable.null` still require reading the whole parent column.
     ReadFromFormatInfo prepareReadingFromFormat(
         const Strings & requested_columns,
         const StorageSnapshotPtr & storage_snapshot,

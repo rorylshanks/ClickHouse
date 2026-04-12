@@ -1,8 +1,10 @@
 #include <Processors/Formats/Impl/Parquet/SchemaConverter.h>
 
+#include <Common/StringUtils.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeDate32.h>
 #include <DataTypes/DataTypeDateTime64.h>
+#include <DataTypes/DataTypeDynamic.h>
 #include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/DataTypeFixedString.h>
 #include <DataTypes/DataTypeLowCardinality.h>
@@ -17,7 +19,9 @@
 #include <DataTypes/NestedUtils.h>
 #include <Formats/FormatFilterInfo.h>
 #include <Processors/Formats/Impl/Parquet/Decoding.h>
+#include <Processors/Formats/Impl/Parquet/VariantUtils.h>
 
+#include <cctype>
 #include <fmt/ranges.h>
 
 namespace DB::ErrorCodes
@@ -25,6 +29,7 @@ namespace DB::ErrorCodes
     extern const int INCORRECT_DATA;
     extern const int DUPLICATE_COLUMN;
     extern const int COLUMN_QUERIED_MORE_THAN_ONCE;
+    extern const int LOGICAL_ERROR;
     extern const int TYPE_MISMATCH;
     extern const int TOO_DEEP_RECURSION;
     extern const int NOT_IMPLEMENTED;
@@ -34,6 +39,41 @@ namespace DB::ErrorCodes
 
 namespace DB::Parquet
 {
+
+namespace
+{
+
+bool isVariantLikeType(const IDataType * type)
+{
+    if (!type)
+        return false;
+
+    if (typeid_cast<const DataTypeDynamic *>(type))
+        return true;
+    if (typeid_cast<const DataTypeString *>(type))
+        return true;
+    if (typeid_cast<const DataTypeObject *>(type))
+        return true;
+    if (const auto * nullable = typeid_cast<const DataTypeNullable *>(type))
+        return isVariantLikeType(nullable->getNestedType().get());
+    return false;
+}
+
+bool startsWithCaseInsensitiveASCII(std::string_view value, std::string_view prefix)
+{
+    if (value.size() < prefix.size())
+        return false;
+
+    for (size_t i = 0; i < prefix.size(); ++i)
+    {
+        if (std::tolower(static_cast<unsigned char>(value[i])) != std::tolower(static_cast<unsigned char>(prefix[i])))
+            return false;
+    }
+
+    return true;
+}
+
+}
 
 SchemaConverter::SchemaConverter(
     const parq::FileMetaData & file_metadata_, const ReadOptions & options_,
@@ -137,6 +177,45 @@ NamesAndTypesList SchemaConverter::inferSchema()
     return res;
 }
 
+bool SchemaConverter::hasRequestedDescendantColumn(const String & prefix) const
+{
+    if (!sample_block || prefix.empty())
+        return false;
+
+    String full_prefix = prefix + ".";
+    for (const auto & column : *sample_block)
+    {
+        if (options.format.parquet.case_insensitive_column_matching)
+        {
+            if (startsWithCaseInsensitiveASCII(column.name, full_prefix))
+                return true;
+        }
+        else if (startsWith(column.name, full_prefix))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+size_t SchemaConverter::schemaIdxAfterSubtree(size_t idx) const
+{
+    if (idx >= file_metadata.schema.size())
+        throw Exception(ErrorCodes::INCORRECT_DATA, "Invalid parquet schema tree");
+
+    const auto & element = file_metadata.schema.at(idx);
+    size_t next_idx = idx + 1;
+
+    if (!element.__isset.num_children || element.num_children <= 0)
+        return next_idx;
+
+    for (Int32 i = 0; i < element.num_children; ++i)
+        next_idx = schemaIdxAfterSubtree(next_idx);
+
+    return next_idx;
+}
+
 std::string_view SchemaConverter::useColumnMapperIfNeeded(const parq::SchemaElement & element, const String & current_path) const
 {
     if (!column_mapper)
@@ -182,9 +261,12 @@ void SchemaConverter::processSubtree(TraversalNode & node)
 
     if (node.schema_context == SchemaContext::None)
     {
-        node.appendNameComponent(node.element->name, useColumnMapperIfNeeded(*node.element, node.name));
+        if (!node.variant || !node.variant->suppress_name_component)
+            node.appendNameComponent(node.element->name, useColumnMapperIfNeeded(*node.element, node.name));
+        else
+            node.variant->suppress_name_component = false;
 
-        if (sample_block)
+        if (sample_block && (!node.variant || !node.variant->skip_requested_lookup))
         {
             /// Doing this lookup on each schema element to support reading individual tuple elements.
             /// E.g.:
@@ -217,6 +299,11 @@ void SchemaConverter::processSubtree(TraversalNode & node)
 
                 idx_in_output_block = pos;
             }
+        }
+        else
+        {
+            if (node.variant)
+                node.variant->skip_requested_lookup = false;
         }
     }
 
@@ -254,6 +341,8 @@ void SchemaConverter::processSubtree(TraversalNode & node)
     /// https://github.com/apache/parquet-format/blob/master/LogicalTypes.md
 
     if (!processSubtreePrimitive(node) &&
+        !processSubtreeVariant(node) &&
+        !processSubtreeVariantTypedWrapper(node) &&
         !processSubtreeMap(node) &&
         !processSubtreeArrayOuter(node) &&
         !processSubtreeArrayInner(node))
@@ -317,6 +406,122 @@ static bool isPrimitiveNode(const parq::SchemaElement & elem)
     return !elem.__isset.num_children || (elem.num_children == 0 && elem.__isset.type);
 }
 
+void SchemaConverter::skipSchemaSubtree()
+{
+    if (schema_idx >= file_metadata.schema.size())
+        throw Exception(ErrorCodes::INCORRECT_DATA, "Invalid parquet schema tree");
+
+    const auto & element = file_metadata.schema.at(schema_idx);
+    ++schema_idx;
+
+    if (isPrimitiveNode(element))
+    {
+        ++primitive_column_idx;
+        return;
+    }
+
+    if (!element.__isset.num_children || element.num_children < 0)
+        throw Exception(ErrorCodes::INCORRECT_DATA, "Invalid parquet schema tree");
+
+    for (Int32 i = 0; i < element.num_children; ++i)
+        skipSchemaSubtree();
+}
+
+size_t SchemaConverter::addVariantPrimitiveColumn(const parq::SchemaElement & element, const String & name, bool output_nullable)
+{
+    chassert(isPrimitiveNode(element));
+    chassert(element.__isset.type && element.type == parq::Type::BYTE_ARRAY);
+
+    /// If any ancestor (including the VARIANT group itself) is OPTIONAL, the leaf
+    /// must also be nullable — rows where the whole VARIANT is absent need to
+    /// produce NULL.  The root level starts with is_array=true, so
+    /// !levels.back().is_array detects at least one OPTIONAL ancestor.
+    if (!output_nullable && !levels.back().is_array)
+        output_nullable = true;
+
+    size_t primitive_idx = primitive_columns.size();
+    PrimitiveColumnInfo & primitive = primitive_columns.emplace_back();
+    primitive.column_idx = primitive_column_idx;
+    primitive.schema_idx = schema_idx;
+    primitive.name = name;
+    primitive.levels = levels;
+    primitive.output_nullable = output_nullable;
+    primitive.decoder.physical_type = element.type;
+    primitive.decoder.allow_stats = true;
+    primitive.decoder.string_converter = std::make_shared<TrivialStringConverter>();
+    primitive.decoded_type = std::make_shared<DataTypeString>();
+    primitive.output_type = primitive.output_nullable ? makeNullable(primitive.decoded_type) : primitive.decoded_type;
+
+    for (const auto & level : levels)
+        if (level.is_array)
+            primitive.max_array_def = level.def;
+
+    if (element.repetition_type != parq::FieldRepetitionType::REQUIRED)
+    {
+        LevelInfo level = levels.back();
+        ++level.def;
+        level.is_array = false;
+        primitive.levels.push_back(level);
+    }
+
+    if (!primitive.levels.empty())
+    {
+        primitive.max_array_def = 0;
+        for (const auto & level : primitive.levels)
+            if (level.is_array)
+                primitive.max_array_def = level.def;
+    }
+
+    ++primitive_column_idx;
+    ++schema_idx;
+    return primitive_idx;
+}
+
+size_t SchemaConverter::addDuplicatedVariantMetadataPrimitive(const TraversalNode & node, const String & name)
+{
+    if (!node.variant || node.variant->metadata_schema_idx == UINT64_MAX || node.variant->metadata_column_idx == UINT64_MAX)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Missing duplicated `Parquet` `VARIANT` metadata dependency for column {}", node.getNameForLogging());
+
+    const auto & element = file_metadata.schema.at(node.variant->metadata_schema_idx);
+    chassert(isPrimitiveNode(element));
+    chassert(element.__isset.type && element.type == parq::Type::BYTE_ARRAY);
+
+    size_t primitive_idx = primitive_columns.size();
+    PrimitiveColumnInfo & primitive = primitive_columns.emplace_back();
+    primitive.column_idx = node.variant->metadata_column_idx;
+    primitive.schema_idx = node.variant->metadata_schema_idx;
+    primitive.name = name;
+    primitive.levels = node.variant->metadata_levels;
+    primitive.output_nullable = false;
+    primitive.decoder.physical_type = element.type;
+    primitive.decoder.allow_stats = true;
+    primitive.decoder.string_converter = std::make_shared<TrivialStringConverter>();
+    primitive.decoded_type = std::make_shared<DataTypeString>();
+    primitive.output_type = primitive.decoded_type;
+
+    for (const auto & level : primitive.levels)
+        if (level.is_array)
+            primitive.max_array_def = level.def;
+
+    if (element.repetition_type != parq::FieldRepetitionType::REQUIRED)
+    {
+        LevelInfo level = primitive.levels.back();
+        ++level.def;
+        level.is_array = false;
+        primitive.levels.push_back(level);
+    }
+
+    if (!primitive.levels.empty())
+    {
+        primitive.max_array_def = 0;
+        for (const auto & level : primitive.levels)
+            if (level.is_array)
+                primitive.max_array_def = level.def;
+    }
+
+    return primitive_idx;
+}
+
 bool SchemaConverter::processSubtreePrimitive(TraversalNode & node)
 {
     if (!isPrimitiveNode(*node.element))
@@ -378,6 +583,13 @@ bool SchemaConverter::processSubtreePrimitive(TraversalNode & node)
         if (options.format.parquet.skip_columns_with_unsupported_types_in_schema_inference &&
             (e.code() == ErrorCodes::INCORRECT_DATA || e.code() == ErrorCodes::NOT_IMPLEMENTED))
         {
+            if (node.variant && node.variant->inside_typed_value)
+            {
+                throw Exception(
+                    ErrorCodes::NOT_IMPLEMENTED,
+                    "Cannot skip unsupported `typed_value` branch while reading `Parquet` `VARIANT` column {}: skipping it would lose shredded data",
+                    node.getNameForLogging());
+            }
             return true;
         }
         else
@@ -430,6 +642,264 @@ bool SchemaConverter::processSubtreePrimitive(TraversalNode & node)
     output.input_type = primitive.output_type;
     output.output_type = node.type_hint ? node.type_hint : inferred_type;
     output.needs_cast = !output.output_type->equals(*output.input_type);
+
+    return true;
+}
+
+bool SchemaConverter::processSubtreeVariant(TraversalNode & node)
+{
+    if (isPrimitiveNode(*node.element))
+        return false;
+
+    /// Only recognize VARIANT columns with an explicit logical type annotation.
+    /// Without it, a struct with children named "metadata"/"value" would be
+    /// incorrectly hijacked from the normal tuple path.
+    if (!node.element->logicalType.__isset.VARIANT)
+        return false;
+
+    const bool has_requested_descendants = !node.requested && hasRequestedDescendantColumn(node.name);
+
+    if (!node.element->__isset.num_children || node.element->num_children < 2)
+        throw Exception(ErrorCodes::INCORRECT_DATA, "Malformed `Parquet` `VARIANT` column {}: expected at least `metadata` and `value` children", node.getNameForLogging());
+
+    bool has_metadata = false;
+    bool has_value = false;
+    size_t metadata_primitive_idx = UINT64_MAX;
+    size_t value_primitive_idx = UINT64_MAX;
+    size_t typed_value_output_idx = UINT64_MAX;
+    size_t primitive_start = primitive_columns.size();
+
+    for (Int32 i = 0; i < node.element->num_children; ++i)
+    {
+        if (schema_idx >= file_metadata.schema.size())
+            throw Exception(ErrorCodes::INCORRECT_DATA, "Invalid parquet schema tree");
+
+        const auto & child = file_metadata.schema.at(schema_idx);
+
+        if (child.name == "metadata")
+        {
+            if (has_metadata)
+                throw Exception(ErrorCodes::INCORRECT_DATA, "Malformed `Parquet` `VARIANT` column {}: duplicate `metadata` child", node.getNameForLogging());
+            if (!isPrimitiveNode(child) || !child.__isset.type || child.type != parq::Type::BYTE_ARRAY)
+                throw Exception(ErrorCodes::INCORRECT_DATA, "Malformed `Parquet` `VARIANT` column {}: `metadata` must be `BYTE_ARRAY`", node.getNameForLogging());
+
+            if (!node.variant)
+                node.variant.emplace();
+            node.variant->metadata_column_idx = primitive_column_idx;
+            node.variant->metadata_schema_idx = schema_idx;
+            node.variant->metadata_levels = levels;
+            if (node.requested)
+                metadata_primitive_idx = addVariantPrimitiveColumn(child, node.name + ".metadata", /*output_nullable=*/ false);
+            else
+                skipSchemaSubtree();
+            has_metadata = true;
+        }
+        else if (child.name == "value")
+        {
+            if (has_value)
+                throw Exception(ErrorCodes::INCORRECT_DATA, "Malformed `Parquet` `VARIANT` column {}: duplicate `value` child", node.getNameForLogging());
+            if (!isPrimitiveNode(child) || !child.__isset.type || child.type != parq::Type::BYTE_ARRAY)
+                throw Exception(ErrorCodes::INCORRECT_DATA, "Malformed `Parquet` `VARIANT` column {}: `value` must be `BYTE_ARRAY`", node.getNameForLogging());
+
+            bool output_nullable = child.repetition_type != parq::FieldRepetitionType::REQUIRED;
+            if (node.requested)
+                value_primitive_idx = addVariantPrimitiveColumn(child, node.name + ".value", output_nullable);
+            else
+                skipSchemaSubtree();
+            has_value = true;
+        }
+        else if (child.name == "typed_value")
+        {
+            if (node.requested || has_requested_descendants)
+            {
+                auto typed_node = node.prepareToRecurse(SchemaContext::None, nullptr);
+                if (!typed_node.variant)
+                    typed_node.variant.emplace();
+                typed_node.variant->inside_typed_value = true;
+                typed_node.variant->suppress_name_component = has_requested_descendants;
+                typed_node.variant->metadata_primitive = metadata_primitive_idx;
+                if (node.variant)
+                {
+                    typed_node.variant->metadata_column_idx = node.variant->metadata_column_idx;
+                    typed_node.variant->metadata_schema_idx = node.variant->metadata_schema_idx;
+                    typed_node.variant->metadata_levels = node.variant->metadata_levels;
+                }
+                processSubtree(typed_node);
+                if (typed_node.output_idx.has_value())
+                    typed_value_output_idx = *typed_node.output_idx;
+            }
+            else
+            {
+                skipSchemaSubtree();
+            }
+        }
+        else
+        {
+            throw Exception(ErrorCodes::INCORRECT_DATA, "Malformed `Parquet` `VARIANT` column {}: unexpected child `{}`", node.getNameForLogging(), child.name);
+        }
+    }
+
+    if (!has_metadata || !has_value)
+        throw Exception(ErrorCodes::INCORRECT_DATA, "Malformed `Parquet` `VARIANT` column {}: missing `metadata` or `value` child", node.getNameForLogging());
+
+    if (!node.requested)
+        return true;
+
+    DataTypePtr inferred_type = std::make_shared<DataTypeDynamic>();
+    DataTypePtr output_type = node.type_hint ? node.type_hint : inferred_type;
+    if (!isVariantLikeType(output_type.get()))
+        throw Exception(ErrorCodes::TYPE_MISMATCH, "Requested type of column {} doesn't match parquet schema: parquet type is `VARIANT`, requested type is {}", node.getNameForLogging(), output_type->getName());
+
+    node.output_idx = output_columns.size();
+    OutputColumnInfo & output = output_columns.emplace_back();
+    output.name = node.name;
+    output.primitive_start = primitive_start;
+    output.primitive_end = primitive_columns.size();
+    output.input_type = output_type;
+    output.output_type = output_type;
+    output.is_variant = true;
+    output.variant_metadata_primitive = metadata_primitive_idx;
+    output.variant_value_primitive = value_primitive_idx;
+    output.variant_typed_value_output = typed_value_output_idx;
+    if (typed_value_output_idx != UINT64_MAX)
+    {
+        output.variant_preserve_empty_typed_fields = output_columns.at(typed_value_output_idx).variant_preserve_empty_typed_fields;
+        output.variant_has_direct_empty_typed_wrapper = output_columns.at(typed_value_output_idx).variant_has_direct_empty_typed_wrapper;
+    }
+    return true;
+}
+
+bool SchemaConverter::processSubtreeVariantTypedWrapper(TraversalNode & node)
+{
+    if (isPrimitiveNode(*node.element) || !node.variant || !node.variant->inside_typed_value)
+        return false;
+
+    if (!node.element->__isset.num_children || node.element->num_children < 1 || node.element->num_children > 2)
+        return false;
+
+    bool has_value_child = false;
+    bool has_typed_value_child = false;
+    bool typed_value_child_is_empty = false;
+    size_t child_idx = schema_idx;
+    for (Int32 i = 0; i < node.element->num_children; ++i)
+    {
+        if (child_idx >= file_metadata.schema.size())
+            throw Exception(ErrorCodes::INCORRECT_DATA, "Invalid parquet schema tree");
+
+        const auto & child = file_metadata.schema.at(child_idx);
+        if (child.name == "value")
+        {
+            if (has_value_child)
+                return false;
+            has_value_child = true;
+        }
+        else if (child.name == "typed_value")
+        {
+            if (has_typed_value_child)
+                return false;
+            has_typed_value_child = true;
+            typed_value_child_is_empty
+                = !isPrimitiveNode(child)
+                && child.__isset.num_children
+                && child.num_children == 0;
+        }
+        else
+        {
+            return false;
+        }
+
+        child_idx = schemaIdxAfterSubtree(child_idx);
+    }
+
+    if (!has_typed_value_child)
+        return false;
+
+    const bool has_requested_descendants = !node.requested && hasRequestedDescendantColumn(node.name);
+    const IDataType * unwrapped_type_hint = unwrapVariantTypeHint(node.type_hint).get();
+    const bool direct_exact_request
+        = node.requested
+        && node.type_hint
+        && !typeid_cast<const DataTypeObject *>(unwrapped_type_hint)
+        && !typeid_cast<const DataTypeDynamic *>(unwrapped_type_hint);
+    const bool can_read_wrapper_directly
+        = !has_value_child || typed_value_child_is_empty;
+    const bool need_wrapper_variant_merge
+        = direct_exact_request
+        && (node.variant->metadata_primitive != UINT64_MAX || node.variant->metadata_schema_idx != UINT64_MAX);
+
+    if (!has_requested_descendants && !direct_exact_request && !can_read_wrapper_directly)
+        return false;
+
+    size_t primitive_start = primitive_columns.size();
+    size_t value_primitive_idx = UINT64_MAX;
+    size_t typed_value_output_idx = UINT64_MAX;
+
+    for (Int32 i = 0; i < node.element->num_children; ++i)
+    {
+        if (schema_idx >= file_metadata.schema.size())
+            throw Exception(ErrorCodes::INCORRECT_DATA, "Invalid parquet schema tree");
+
+        const auto & child = file_metadata.schema.at(schema_idx);
+        if (child.name == "typed_value")
+        {
+            auto typed_node = node.prepareToRecurse(SchemaContext::None, need_wrapper_variant_merge ? nullptr : node.type_hint);
+            if (!typed_node.variant)
+                typed_node.variant.emplace();
+            typed_node.variant->suppress_name_component = true;
+            typed_node.variant->skip_requested_lookup = direct_exact_request;
+            processSubtree(typed_node);
+            typed_value_output_idx = typed_node.output_idx.value_or(UINT64_MAX);
+            if (!need_wrapper_variant_merge)
+            {
+                if (can_read_wrapper_directly && typed_node.output_idx.has_value())
+                {
+                    output_columns.at(*typed_node.output_idx).variant_preserve_empty_typed_fields = true;
+                    output_columns.at(*typed_node.output_idx).variant_has_direct_empty_typed_wrapper = typed_value_child_is_empty;
+                }
+                node.output_idx = typed_node.output_idx;
+            }
+        }
+        else if (child.name == "value")
+        {
+            if (need_wrapper_variant_merge)
+            {
+                bool output_nullable = child.repetition_type != parq::FieldRepetitionType::REQUIRED;
+                value_primitive_idx = addVariantPrimitiveColumn(child, node.name + ".value", output_nullable);
+            }
+            else
+            {
+                skipSchemaSubtree();
+            }
+        }
+        else
+        {
+            throw Exception(
+                ErrorCodes::INCORRECT_DATA,
+                "Malformed nested `Parquet` `VARIANT` field {}: unexpected child `{}`",
+                node.getNameForLogging(),
+                child.name);
+        }
+    }
+
+    if (need_wrapper_variant_merge && (value_primitive_idx != UINT64_MAX || typed_value_output_idx != UINT64_MAX))
+    {
+        size_t metadata_primitive_idx = node.variant->metadata_primitive;
+        if (metadata_primitive_idx == UINT64_MAX)
+            metadata_primitive_idx = addDuplicatedVariantMetadataPrimitive(node, node.name + ".__variant_metadata");
+
+        node.output_idx = output_columns.size();
+        OutputColumnInfo & output = output_columns.emplace_back();
+        output.name = node.name;
+        output.primitive_start = std::min(primitive_start, metadata_primitive_idx);
+        output.primitive_end = primitive_columns.size();
+        output.input_type = node.type_hint;
+        output.output_type = node.type_hint;
+        output.is_variant = true;
+        output.variant_metadata_primitive = metadata_primitive_idx;
+        output.variant_value_primitive = value_primitive_idx;
+        output.variant_typed_value_output = typed_value_output_idx;
+        output.variant_string_output_uses_json = false;
+    }
 
     return true;
 }
@@ -600,6 +1070,7 @@ void SchemaConverter::processSubtreeTuple(TraversalNode & node)
     ///    In other modes, we skip the whole tuple if any element is unsupported.
 
     bool lookup_by_name = false;
+    bool infer_tuple_structure = false;
     std::vector<size_t> elements;
     if (tuple_type_hint)
     {
@@ -614,30 +1085,44 @@ void SchemaConverter::processSubtreeTuple(TraversalNode & node)
         {
             if (tuple_type_hint->getElements().size() != size_t(node.element->num_children))
                 throw Exception(ErrorCodes::TYPE_MISMATCH, "Requested type of column {} doesn't match parquet schema: parquet type is Tuple with {} elements, requested type is Tuple with {} elements", node.getNameForLogging(), node.element->num_children, tuple_type_hint->getElements().size());
+            elements.resize(size_t(node.element->num_children), UINT64_MAX);
         }
     }
-    if (!lookup_by_name && node.requested)
-        elements.resize(size_t(node.element->num_children), UINT64_MAX);
+    else if (node.requested)
+    {
+        infer_tuple_structure = true;
+        elements.reserve(size_t(node.element->num_children));
+    }
 
     Strings names;
     DataTypes types;
-    if (!tuple_type_hint && node.requested)
+    if (infer_tuple_structure)
     {
-        names.resize(elements.size());
-        types.resize(elements.size());
+        names.reserve(size_t(node.element->num_children));
+        types.reserve(size_t(node.element->num_children));
     }
 
     size_t primitive_start = primitive_columns.size();
     size_t output_start = output_columns.size();
-    size_t skipped_unsupported_columns = 0;
     std::vector<String> element_names_in_file;
     for (size_t i = 0; i < size_t(node.element->num_children); ++i)
     {
         const String & element_name = element_names_in_file.emplace_back(useColumnMapperIfNeeded(file_metadata.schema.at(schema_idx), node.name));
-        std::optional<size_t> idx_in_output_tuple = i - skipped_unsupported_columns;
+        std::optional<size_t> idx_in_output_tuple = tuple_type_hint ? std::make_optional(i) : std::nullopt;
         if (lookup_by_name)
         {
             idx_in_output_tuple = tuple_type_hint->tryGetPositionByName(element_name, options.format.parquet.case_insensitive_column_matching);
+
+            if (idx_in_output_tuple.has_value() && idx_in_output_tuple.value() >= elements.size())
+            {
+                throw Exception(
+                    ErrorCodes::LOGICAL_ERROR,
+                    "Internal error while matching tuple {} by name: child `{}` resolved to position {}, but tuple hint has only {} elements",
+                    node.getNameForLogging(),
+                    element_name,
+                    idx_in_output_tuple.value(),
+                    elements.size());
+            }
 
             if (idx_in_output_tuple.has_value() && elements.at(idx_in_output_tuple.value()) != UINT64_MAX)
                 throw Exception(ErrorCodes::DUPLICATE_COLUMN, "Parquet tuple {} has multiple elements with name `{}`", node.getNameForLogging(), element_name);
@@ -647,7 +1132,7 @@ void SchemaConverter::processSubtreeTuple(TraversalNode & node)
         if (tuple_type_hint && idx_in_output_tuple.has_value())
             element_type_hint = tuple_type_hint->getElement(idx_in_output_tuple.value());
 
-        const bool element_requested = node.requested && idx_in_output_tuple.has_value();
+        const bool element_requested = node.requested && (infer_tuple_structure || idx_in_output_tuple.has_value());
 
         TraversalNode subnode = node.prepareToRecurse(SchemaContext::None, element_type_hint);
         subnode.requested = element_requested;
@@ -671,25 +1156,32 @@ void SchemaConverter::processSubtreeTuple(TraversalNode & node)
                 }
                 else
                 {
-                    skipped_unsupported_columns += 1;
-                    elements.pop_back();
-                    names.pop_back();
-                    types.pop_back();
                     continue;
                 }
             }
 
-            elements.at(idx_in_output_tuple.value()) = element_idx.value();
-
             const auto & type = output_columns.at(element_idx.value()).output_type;
             if (tuple_type_hint)
             {
+                if (idx_in_output_tuple.value() >= elements.size())
+                {
+                    throw Exception(
+                        ErrorCodes::LOGICAL_ERROR,
+                        "Internal error while assembling tuple {}: child `{}` mapped to position {}, but tuple has only {} positions",
+                        node.getNameForLogging(),
+                        element_name,
+                        idx_in_output_tuple.value(),
+                        elements.size());
+                }
+
+                elements.at(idx_in_output_tuple.value()) = element_idx.value();
                 chassert(type->equals(*element_type_hint));
             }
             else
             {
-                names.at(idx_in_output_tuple.value()) = element_name;
-                types.at(idx_in_output_tuple.value()) = type;
+                elements.push_back(element_idx.value());
+                names.push_back(element_name);
+                types.push_back(type);
             }
         }
     }
@@ -735,6 +1227,16 @@ void SchemaConverter::processSubtreeTuple(TraversalNode & node)
     output.input_type = std::move(output_type);
     output.output_type = output.input_type;
     output.nested_columns = elements;
+    for (size_t element_idx : elements)
+    {
+        if (element_idx != UINT64_MAX && output_columns.at(element_idx).variant_preserve_empty_typed_fields)
+        {
+            output.variant_preserve_empty_typed_fields = true;
+        }
+
+        if (element_idx != UINT64_MAX && output_columns.at(element_idx).variant_has_direct_empty_typed_wrapper)
+            output.variant_has_direct_empty_typed_wrapper = true;
+    }
 }
 
 void SchemaConverter::processPrimitiveColumn(

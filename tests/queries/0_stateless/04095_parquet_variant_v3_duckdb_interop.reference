@@ -1,0 +1,4 @@
+Dynamic	Tuple(a Nullable(String), d String)	{"a":null,"d":"iceberg"}
+Dynamic	Array(String)	[]
+Dynamic	Tuple(a Array(String))	{"a":[]}
+Dynamic	Tuple(b Int64)	{"b":1}

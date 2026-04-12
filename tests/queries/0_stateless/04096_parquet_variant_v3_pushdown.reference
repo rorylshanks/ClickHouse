@@ -1,0 +1,3 @@
+commit	did:plc:a	app.bsky.feed.post	create	1
+commit	did:plc:b	app.bsky.feed.like	delete	2
+identity	did:plc:c			3

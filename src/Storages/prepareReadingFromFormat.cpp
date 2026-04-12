@@ -1,4 +1,6 @@
 #include <Storages/prepareReadingFromFormat.h>
+#include <DataTypes/DataTypeDynamic.h>
+#include <DataTypes/DataTypeObject.h>
 #include <Formats/FormatFactory.h>
 #include <Core/Settings.h>
 #include <Interpreters/Context.h>
@@ -22,6 +24,20 @@ namespace ErrorCodes
 namespace Setting
 {
     extern const SettingsBool enable_parsing_to_custom_serialization;
+}
+
+namespace
+{
+
+bool canReadDirectParquetSubcolumn(const NameAndTypePair & column_to_read)
+{
+    if (!column_to_read.isSubcolumn())
+        return false;
+
+    const auto * type_in_storage = column_to_read.getTypeInStorage().get();
+    return typeid_cast<const DataTypeObject *>(type_in_storage) || typeid_cast<const DataTypeDynamic *>(type_in_storage);
+}
+
 }
 
 ReadFromFormatInfo prepareReadingFromFormat(
@@ -122,13 +138,10 @@ ReadFromFormatInfo prepareReadingFromFormat(
 
 Names filterTupleColumnsToRead(NamesAndTypesList & requested_columns)
 {
-    /// Format can read tuple element subcolumns, e.g. `t.x` or `t.a.x`.
+    /// Format can read tuple element subcolumns, e.g. `t.x` or `t.a.x`, and some formats
+    /// can also read fixed `JSON` / `Dynamic` subcolumns directly.
     /// But we still need to do some processing on the set of requested columns:
-    ///  * If a non-tuple-element subcolumn is requested, request the whole column.
-    ///    E.g. if the type of `t` is Object, `t.x` is a dynamic subcolumn, and we should
-    ///    request the whole `t` instead. Reading a subset of dynamic subcolumns is
-    ///    currently not supported by any format parser (though we might want to add it in
-    ///    future for parquet variant columns).
+    ///  * If a subcolumn isn't one of these supported cases, request the whole parent column.
     ///  * Don't request tuple element if the whole tuple is also requested.
     ///    E.g. `SELECT t, t.x` should just read `t`.
 
@@ -207,11 +220,19 @@ Names filterTupleColumnsToRead(NamesAndTypesList & requested_columns)
                 column_info.type = ISerialization::createFromPath(column_info.path, column_info.path.size()).type;
         }
 
-        column_info.name = column_to_read.getNameInStorage();
-        if (!column_info.path.empty())
+        if (column_info.path.empty() && canReadDirectParquetSubcolumn(column_to_read))
         {
-            column_info.name += '.';
-            column_info.name += ISerialization::getSubcolumnNameForStream(column_info.path);
+            column_info.name = column_to_read.name;
+            column_info.type = column_to_read.type;
+        }
+        else
+        {
+            column_info.name = column_to_read.getNameInStorage();
+            if (!column_info.path.empty())
+            {
+                column_info.name += '.';
+                column_info.name += ISerialization::getSubcolumnNameForStream(column_info.path);
+            }
         }
         bool emplaced = name_to_idx.emplace(column_info.name, idx).second;
         column_info.is_duplicate = !emplaced;
@@ -243,6 +264,26 @@ Names filterTupleColumnsToRead(NamesAndTypesList & requested_columns)
                 column_to_read.setDelimiterAndTypeInStorage(ancestor_name, ancestor_info.type);
                 ancestor_requested = true;
                 break;
+            }
+        }
+        if (!ancestor_requested && column_to_read.isSubcolumn() && column_info.name == column_to_read.name)
+        {
+            String ancestor_name = column_to_read.getNameInStorage();
+            while (true)
+            {
+                auto it = name_to_idx.find(ancestor_name);
+                if (it != name_to_idx.end())
+                {
+                    const auto & ancestor_info = columns_info[it->second];
+                    column_to_read.setDelimiterAndTypeInStorage(ancestor_name, ancestor_info.type);
+                    ancestor_requested = true;
+                    break;
+                }
+
+                size_t next_dot = column_info.name.find('.', ancestor_name.size() + 1);
+                if (next_dot == String::npos)
+                    break;
+                ancestor_name = column_info.name.substr(0, next_dot);
             }
         }
         if (ancestor_requested)

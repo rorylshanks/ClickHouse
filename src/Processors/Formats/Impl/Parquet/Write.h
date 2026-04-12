@@ -2,8 +2,10 @@
 
 #include <Columns/IColumn_fwd.h>
 #include <DataTypes/IDataType.h>
+#include <Formats/FormatSettings.h>
 #include <IO/CompressionMethod.h>
 #include <Processors/Formats/Impl/Parquet/ThriftUtil.h>
+#include <Processors/Formats/Impl/Parquet/VariantWrite.h>
 #include <generated/parquet_types.h>
 #include <Common/PODArray.h>
 
@@ -132,6 +134,7 @@ struct FileWriteState
 
 using SchemaElements = std::vector<parq::SchemaElement>;
 using ColumnChunkWriteStates = std::vector<ColumnChunkWriteState>;
+using VariantWriteTypeHints = std::unordered_map<std::string, DataTypePtr>;
 
 /// Parquet file consists of row groups, which consist of column chunks.
 ///
@@ -168,8 +171,11 @@ using ColumnChunkWriteStates = std::vector<ColumnChunkWriteState>;
 SchemaElements convertSchema(const Block & sample, const WriteOptions & options, const std::optional<std::unordered_map<String, Int64>> & column_field_ids);
 
 void prepareColumnForWrite(
-    ColumnPtr column, DataTypePtr type, const std::string & name, const WriteOptions & options,
-    ColumnChunkWriteStates * out_columns_to_write, SchemaElements * out_schema = nullptr, const std::optional<std::unordered_map<String, Int64>> & column_field_ids = std::nullopt);
+    ColumnPtr column, DataTypePtr type, const std::string & name, const WriteOptions & options, const FormatSettings & format_settings,
+    ColumnChunkWriteStates * out_columns_to_write, SchemaElements * out_schema = nullptr,
+    const std::optional<std::unordered_map<String, Int64>> & column_field_ids = std::nullopt,
+    const VariantWriteTypeHints * variant_type_hints = nullptr,
+    VariantWriteTypeHints * out_variant_type_hints = nullptr);
 
 void writeFileHeader(FileWriteState & file, WriteBuffer & out);
 

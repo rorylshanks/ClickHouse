@@ -1,22 +1,48 @@
 #include <Columns/ColumnArray.h>
+#include <Columns/ColumnDynamic.h>
 #include <Columns/ColumnMap.h>
 #include <Columns/ColumnNullable.h>
+#include <Columns/ColumnObject.h>
 #include <Columns/ColumnsCommon.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnTuple.h>
 #include <Columns/FilterDescription.h>
+#include <Common/Base64.h>
 #include <Common/FieldAccurateComparison.h>
+#include <DataTypes/DataTypeArray.h>
+#include <DataTypes/DataTypeDynamic.h>
+#include <DataTypes/DataTypeFactory.h>
+#include <DataTypes/DataTypeMap.h>
+#include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeNothing.h>
+#include <DataTypes/DataTypeObject.h>
+#include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypeTuple.h>
+#include <DataTypes/DataTypeUUID.h>
+#include <DataTypes/DataTypeVariant.h>
+#include <DataTypes/DataTypesDecimal.h>
+#include <DataTypes/NestedUtils.h>
 #include <Formats/FormatFilterInfo.h>
+#include <Formats/SchemaInferenceUtils.h>
+#include <Interpreters/convertFieldToType.h>
 #include <Interpreters/castColumn.h>
 #include <IO/CompressionMethod.h>
+#include <IO/ReadBufferFromString.h>
 #include <Processors/Formats/Impl/Parquet/Decoding.h>
 #include <Processors/Formats/Impl/Parquet/parquetBloomFilterHash.h>
 #include <Processors/Formats/Impl/Parquet/Reader.h>
 #include <Processors/Formats/Impl/Parquet/SchemaConverter.h>
+#include <Processors/Formats/Impl/Parquet/VariantEncoding.h>
+#include <Processors/Formats/Impl/Parquet/VariantReader.h>
+#include <Processors/Formats/Impl/Parquet/VariantUtils.h>
 #include <Storages/SelectQueryInfo.h>
 #include <Storages/MergeTree/MergeTreeRangeReader.h>
 #include <Storages/MergeTree/MergeTreeSplitPrewhereIntoReadSteps.h>
 
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <mutex>
 #include <lz4.h>
 #include <arrow/util/crc32.h>
@@ -33,6 +59,7 @@ namespace DB::ErrorCodes
     extern const int INCORRECT_DATA;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
+    extern const int TOO_DEEP_RECURSION;
     extern const int CHECKSUM_DOESNT_MATCH;
 }
 
@@ -2023,7 +2050,7 @@ void Reader::decompressPageIfCompressed(PageState & page)
     page.codec = parq::CompressionCodec::UNCOMPRESSED;
 }
 
-MutableColumnPtr Reader::formOutputColumn(RowSubgroup & row_subgroup, size_t output_column_idx, size_t num_rows)
+MutableColumnPtr Reader::formOutputColumn(RowSubgroup & row_subgroup, size_t output_column_idx, size_t num_rows, bool skip_cast)
 {
     const OutputColumnInfo & output_info = output_columns.at(output_column_idx);
     MutableColumnPtr res;
@@ -2041,6 +2068,12 @@ MutableColumnPtr Reader::formOutputColumn(RowSubgroup & row_subgroup, size_t out
             row_subgroup.block_missing_values.setBits(*output_info.idx_in_output_block, num_rows);
         }
 
+        return res;
+    }
+
+    if (output_info.is_variant)
+    {
+        res = VariantReader::formOutputColumn(*this, row_subgroup, output_info, num_rows);
         return res;
     }
 
@@ -2083,14 +2116,14 @@ MutableColumnPtr Reader::formOutputColumn(RowSubgroup & row_subgroup, size_t out
                 throw Exception(ErrorCodes::INCORRECT_DATA, "Invalid array of tuples: tuple elements {} and {} have different array lengths", primitive_columns.at(output_info.primitive_start).name, primitive_columns.at(i).name);
         }
 
-        MutableColumnPtr nested = formOutputColumn(row_subgroup, output_info.nested_columns.at(0), offsets.back());
+        MutableColumnPtr nested = formOutputColumn(row_subgroup, output_info.nested_columns.at(0), offsets.back(), skip_cast);
         res = ColumnArray::create(std::move(nested), std::move(offsets_column));
     }
     else if (kind == TypeIndex::Tuple)
     {
         MutableColumns columns;
         for (size_t idx : output_info.nested_columns)
-            columns.push_back(formOutputColumn(row_subgroup, idx, num_rows));
+            columns.push_back(formOutputColumn(row_subgroup, idx, num_rows, skip_cast));
         if (columns.empty())
             res = ColumnTuple::create(num_rows);
         else
@@ -2100,13 +2133,13 @@ MutableColumnPtr Reader::formOutputColumn(RowSubgroup & row_subgroup, size_t out
     {
         chassert(kind == TypeIndex::Map);
         chassert(output_info.nested_columns.size() == 1);
-        MutableColumnPtr nested = formOutputColumn(row_subgroup, output_info.nested_columns.at(0), num_rows);
+        MutableColumnPtr nested = formOutputColumn(row_subgroup, output_info.nested_columns.at(0), num_rows, skip_cast);
         res = ColumnMap::create(std::move(nested));
     }
 
     chassert(res->getDataType() == output_info.input_type->getColumnType());
 
-    if (output_info.needs_cast)
+    if (output_info.needs_cast && !skip_cast)
     {
         auto col = castColumn(
             {std::move(res), output_info.input_type, output_info.name}, output_info.output_type);

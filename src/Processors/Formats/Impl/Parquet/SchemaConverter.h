@@ -58,6 +58,17 @@ private:
         ListElement,
     };
 
+    struct VariantTraversalContext
+    {
+        bool inside_typed_value = false;
+        bool suppress_name_component = false;
+        bool skip_requested_lookup = false;
+        size_t metadata_primitive = UINT64_MAX;
+        size_t metadata_column_idx = UINT64_MAX;
+        size_t metadata_schema_idx = UINT64_MAX;
+        std::vector<LevelInfo> metadata_levels;
+    };
+
     /// Parameters of a recursive call that traverses a subtree, corresponding to a parquet SchemaElement.
     struct TraversalNode
     {
@@ -75,6 +86,7 @@ private:
         std::optional<String> parquet_name;
         DataTypePtr type_hint;
         bool requested = false;
+        std::optional<VariantTraversalContext> variant;
 
         /// These are assigned by the callee.
         const parq::SchemaElement * element = nullptr;
@@ -119,6 +131,9 @@ private:
     };
 
     void checkHasColumns();
+    bool hasRequestedDescendantColumn(const String & prefix) const;
+    size_t schemaIdxAfterSubtree(size_t idx) const;
+    size_t addDuplicatedVariantMetadataPrimitive(const TraversalNode & node, const String & name);
 
     void processSubtree(TraversalNode & node);
 
@@ -126,10 +141,15 @@ private:
     /// Return true if the schema element was recognized as the corresponding kind,
     /// even if no output column needs to be produced.
     bool processSubtreePrimitive(TraversalNode & node);
+    bool processSubtreeVariant(TraversalNode & node);
+    bool processSubtreeVariantTypedWrapper(TraversalNode & node);
     bool processSubtreeMap(TraversalNode & node);
     bool processSubtreeArrayOuter(TraversalNode & node);
     bool processSubtreeArrayInner(TraversalNode & node);
     void processSubtreeTuple(TraversalNode & node);
+
+    void skipSchemaSubtree();
+    size_t addVariantPrimitiveColumn(const parq::SchemaElement & element, const String & name, bool output_nullable);
 
     void processPrimitiveColumn(
         const parq::SchemaElement & element, DataTypePtr type_hint,

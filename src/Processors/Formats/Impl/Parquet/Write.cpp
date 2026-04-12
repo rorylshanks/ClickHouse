@@ -1271,7 +1271,6 @@ void writeColumnChunkBody(
         case TypeIndex::Object:
             writeColumnImpl<parquet::ByteArrayType>(s, options, out, ConverterJSON(s.primitive_column, s.type, format_settings));
             break;
-
         #define F(source_type) \
             writeColumnImpl<parquet::FLBAType>( \
                 s, options, out, ConverterNumberAsFixedString<source_type>(s.primitive_column))

@@ -1,0 +1,26 @@
+id	id	Int(bitWidth=64, isSigned=false)
+metadata	var.metadata	String
+typed_value	var.typed_value.a.typed_value	None
+value	var.typed_value.a.value	String
+typed_value	var.typed_value.another.typed_value.q.typed_value	None
+value	var.typed_value.another.typed_value.q.value	String
+value	var.typed_value.another.value	String
+typed_value	var.typed_value.c.typed_value.list.element.typed_value	None
+value	var.typed_value.c.typed_value.list.element.value	String
+value	var.typed_value.c.value	String
+typed_value	var.typed_value.extra.typed_value	String
+value	var.typed_value.extra.value	String
+value	var.value	String
+1	{"a":1,"c":["x",2],"extra":"keep"}
+2	{"a":2,"c":[{"z":3}]}
+3	{"a":3,"extra":"x"}
+4	{"a":4,"another":{"q":1},"c":[1,2,3]}
+1	Tuple(a Int64, c Array(Dynamic), extra String)	{"a":1,"c":["x",2],"extra":"keep"}
+2	Tuple(a Int64, c Array(Tuple(z Int64)))	{"a":2,"c":[{"z":3}]}
+3	Tuple(a Int64, extra String)	{"a":3,"extra":"x"}
+4	Tuple(a Int64, another Tuple(q Int64), c Array(Int64))	{"a":4,"another":{"q":1},"c":[1,2,3]}
+1	Tuple(a Int64, c Array(Dynamic), extra String)	{"a":1,"c":["x",2],"extra":"keep"}
+2	Tuple(a Int64, c Array(Tuple(z Int64)), extra Nullable(String))	{"a":2,"c":[{"z":3}],"extra":null}
+3	String	"iceberg"
+4	Array(Dynamic)	[1,{"a":4,"extra":"x"},null]
+5	None	\N

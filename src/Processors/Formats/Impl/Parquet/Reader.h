@@ -198,9 +198,16 @@ struct Reader
         std::optional<size_t> idx_in_output_block;
         std::vector<size_t> nested_columns;
         bool is_primitive = false;
+        bool is_variant = false;
         /// Column not in the file, fill it with default values.
         bool is_missing_column = false;
         bool needs_cast = false; // if output_type is different from input_type
+        size_t variant_metadata_primitive = UINT64_MAX;
+        size_t variant_value_primitive = UINT64_MAX;
+        size_t variant_typed_value_output = UINT64_MAX;
+        bool variant_string_output_uses_json = true;
+        bool variant_preserve_empty_typed_fields = false;
+        bool variant_has_direct_empty_typed_wrapper = false;
 
         /// If type is Array, this is the repetition level of that array.
         /// `rep - 1` is index in ColumnChunk::arrays_offsets.
@@ -517,7 +524,7 @@ struct Reader
     /// Moves the column out of ColumnSubchunk-s, leaving nullptrs in ColumnSubchunk::column.
     /// The caller is responsible for caching the result (in RowSubGroup::output) to make sure this
     /// is not called again for the moved-out columns.
-    MutableColumnPtr formOutputColumn(RowSubgroup & row_subgroup, size_t output_column_idx, size_t num_rows);
+    MutableColumnPtr formOutputColumn(RowSubgroup & row_subgroup, size_t output_column_idx, size_t num_rows, bool skip_cast = false);
     ColumnPtr & getOrFormOutputColumn(RowSubgroup & row_subgroup, size_t idx_in_output_block);
 
     void applyPrewhere(RowSubgroup & row_subgroup, const RowGroup & row_group, size_t step_idx);

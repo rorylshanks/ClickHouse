@@ -2044,7 +2044,7 @@ ColumnObject::SortedPathsIterator::SortedPathsIterator(const ColumnObject & colu
 {
     std::tie(shared_data_paths, shared_data_values) = column_object.getSharedDataPathsAndValues();
     const auto & shared_data_offsets = column_object.getSharedDataOffsets();
-    shared_data_it = shared_data_offsets[row - 1];
+    shared_data_it = shared_data_offsets[static_cast<ssize_t>(row) - 1];
     shared_data_end = shared_data_offsets[row];
     setCurrentPath();
 }

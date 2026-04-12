@@ -1,0 +1,16 @@
+typed_value	var.typed_value.dt_local.typed_value	INT64	Timestamp(isAdjustedToUTC=true, timeUnit=milliseconds, is_from_converted_type=false, force_set_converted_type=false)
+value	var.typed_value.dt_local.value	BYTE_ARRAY	String
+typed_value	var.typed_value.dt_ny.typed_value	INT64	Timestamp(isAdjustedToUTC=true, timeUnit=milliseconds, is_from_converted_type=false, force_set_converted_type=false)
+value	var.typed_value.dt_ny.value	BYTE_ARRAY	String
+typed_value	var.typed_value.dt_utc.typed_value	INT64	Timestamp(isAdjustedToUTC=true, timeUnit=milliseconds, is_from_converted_type=false, force_set_converted_type=false)
+value	var.typed_value.dt_utc.value	BYTE_ARRAY	String
+typed_value	var.typed_value.u16.typed_value	INT32	Int(bitWidth=16, isSigned=false)
+value	var.typed_value.u16.value	BYTE_ARRAY	String
+typed_value	var.typed_value.u32.typed_value	INT32	Int(bitWidth=32, isSigned=false)
+value	var.typed_value.u32.value	BYTE_ARRAY	String
+typed_value	var.typed_value.u8.typed_value	INT32	Int(bitWidth=8, isSigned=false)
+value	var.typed_value.u8.value	BYTE_ARRAY	String
+DateTime	2024-01-02 03:04:05	DateTime('UTC')	2024-01-02 03:04:05	DateTime('America/New_York')	2024-01-02 03:04:05	UInt8	255	UInt16	65535	UInt32	4294967295
+1	DateTime64(9)	"2024-01-02 03:04:05.123456700"
+2	DateTime64(9)	"2024-01-02 03:04:05.123456780"
+3	DateTime64(9)	"2024-01-02 03:04:05.123456789"

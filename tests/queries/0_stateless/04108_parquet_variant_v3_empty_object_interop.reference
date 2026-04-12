@@ -1,0 +1,5 @@
+Dynamic	JSON	{}
+Dynamic	JSON	{"a":{}}
+{"a":{}}	JSON(a JSON)
+Dynamic	Tuple(a Array(String))	{"a":[]}
+{"a":[]}	[]
