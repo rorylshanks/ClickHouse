@@ -1,6 +1,7 @@
 #include <Functions/IFunction.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Columns/ColumnConst.h>
@@ -73,6 +74,25 @@ public:
     bool useDefaultImplementationForNulls() const override { return null_is_skipped; }
 
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
+
+    ColumnPtr getConstantResultForNonConstArguments(
+        const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type) const override
+    {
+        /// Standard `IN` over a Nullable left argument can return NULL even for an empty set.
+        if (ignore_set || canContainNull(*result_type))
+            return nullptr;
+
+        const auto * column_set = checkAndGetColumnConstData<const ColumnSet>(arguments[1].column.get());
+        if (!column_set)
+            column_set = checkAndGetColumn<const ColumnSet>(arguments[1].column.get());
+
+        const auto future_set = column_set ? column_set->getData() : nullptr;
+        const auto set = future_set ? future_set->get() : nullptr;
+        if (!set || set->getTotalRowCount() != 0)
+            return nullptr;
+
+        return result_type->createColumnConst(1, static_cast<UInt8>(negative));
+    }
 
     ColumnPtr executeImplDryRun(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
     {

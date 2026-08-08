@@ -2285,7 +2285,26 @@ void ReadFromMergeTree::buildIndexes(
     const bool skip_constant_folding = skip_partition_pruning_ || !settings[Setting::use_constant_folding_in_index_analysis];
 
     auto filter_dag_ptr = std::make_shared<ActionsDAGWithInversionPushDown>(filter_actions_dag_ ? filter_actions_dag_->getOutputs().front() : nullptr, query_context, /* boolean_context */ true);
+    if (filter_dag_ptr->dag)
+        filter_dag_ptr->dag->removeUnusedActions(/*allow_remove_inputs=*/false, /*allow_constant_folding=*/true, /*evaluate_constants=*/true);
     const auto & filter_dag = *filter_dag_ptr;
+
+    /// Index condition construction can prepare subquery sets. Fold again afterwards so `FunctionIn`
+    /// can reduce empty prepared sets before granules are analyzed. The folded DAG is stable on the recursive call.
+    auto rebuild_with_folded_filter = [&]()
+    {
+        if (!filter_actions_dag_)
+            return;
+
+        ActionsDAGWithInversionPushDown folded_filter(filter_actions_dag_->getOutputs().front(), query_context, /* boolean_context */ true);
+        folded_filter.dag->removeUnusedActions(/*allow_remove_inputs=*/false, /*allow_constant_folding=*/true, /*evaluate_constants=*/true);
+        if (folded_filter.dag->getHash() == filter_dag.dag->getHash())
+            return;
+
+        buildIndexes(
+            indexes, &*folded_filter.dag, data, parts, vector_search_parameters, top_k_filter_info,
+            query_context, query_info_, metadata_snapshot, skip_partition_pruning_);
+    };
 
     {
         auto key_condition_factory = [query_context, metadata_snapshot](const ActionsDAG *, const ActionsDAG::Node * predicate)
@@ -2350,12 +2369,18 @@ void ReadFromMergeTree::buildIndexes(
         indexes->use_skip_indexes = false;
 
     if (!indexes->use_skip_indexes)
+    {
+        rebuild_with_folded_filter();
         return;
+    }
 
     const auto & all_indexes = metadata_snapshot->getSecondaryIndices();
 
     if (all_indexes.empty())
+    {
+        rebuild_with_folded_filter();
         return;
+    }
 
     std::unordered_set<std::string> ignored_index_names;
 
@@ -2514,6 +2539,7 @@ void ReadFromMergeTree::buildIndexes(
     }
 
     indexes->skip_indexes = std::move(skip_indexes);
+    rebuild_with_folded_filter();
 }
 
 bool ReadFromMergeTree::isRowPolicyDeferredAfterFinal() const
