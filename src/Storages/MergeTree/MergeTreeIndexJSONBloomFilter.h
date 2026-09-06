@@ -9,6 +9,22 @@ namespace DB
 class RPNBuilderTreeNode;
 class JSONBloomPathMatcher;
 
+struct JSONBloomFilterProbe
+{
+    UInt64 hash;
+    bool is_presence = false;
+    std::optional<UInt64> required_presence = std::nullopt;
+    auto operator<=>(const JSONBloomFilterProbe &) const = default;
+};
+
+struct JSONBloomFilterTokens
+{
+    HashSet<UInt64, TrivialHash> values;
+    HashSet<UInt64, TrivialHash> presence;
+};
+
+using JSONBloomFilterPaths = std::unordered_map<String, JSONBloomFilterTokens>;
+
 struct MergeTreeIndexJSONBloomFilterPartMetadata final : IMergeTreeIndexPartMetadata
 {
     MergeTreeIndexJSONBloomFilterPartMetadata(
@@ -26,7 +42,7 @@ struct MergeTreeIndexJSONBloomFilterPartMetadata final : IMergeTreeIndexPartMeta
     std::shared_ptr<const JSONBloomPathMatcher> path_matcher;
 };
 
-class MergeTreeIndexGranuleJSONBloomFilter final : public MergeTreeIndexGranuleBloomFilter
+class MergeTreeIndexGranuleJSONBloomFilter final : public IMergeTreeIndexGranule
 {
 public:
     MergeTreeIndexGranuleJSONBloomFilter(
@@ -36,16 +52,31 @@ public:
     MergeTreeIndexGranuleJSONBloomFilter(
         size_t bits_per_row_,
         size_t hash_functions_,
-        const std::vector<HashSet<UInt64>> & column_hashes_,
+        const JSONBloomFilterPaths & paths_,
         std::shared_ptr<const JSONBloomPathMatcher> path_matcher_);
 
+    void serializeBinary(WriteBuffer & ostr) const override;
     void deserializeBinary(ReadBuffer & istr, MergeTreeIndexVersion version) override;
-    size_t getHashFunctions() const { return hash_functions; }
+    void serializeBinaryWithMultipleStreams(MergeTreeIndexOutputStreams & streams) const override;
+    void deserializeBinaryWithMultipleStreams(MergeTreeIndexInputStreams & streams, MergeTreeIndexDeserializationState & state) override;
+    bool empty() const override { return !has_rows; }
+    size_t memoryUsageBytes() const override;
+    bool matches(const String & path, const JSONBloomFilterProbe & probe, bool pending_matches) const;
     const JSONBloomPathMatcher & getPathMatcher() const { return *path_matcher; }
 
 private:
+    struct PathFilter
+    {
+        std::vector<UInt64> presence;
+        BloomFilterPtr values;
+        bool present = false;
+        bool pending = false;
+    };
+    std::unordered_map<String, PathFilter> paths;
+    size_t bits_per_row;
     size_t hash_functions;
     std::shared_ptr<const JSONBloomPathMatcher> path_matcher;
+    bool has_rows = false;
 };
 
 class MergeTreeIndexAggregatorJSONBloomFilter final : public IMergeTreeIndexAggregator
@@ -68,7 +99,7 @@ private:
     String column_name;
     DataTypePtr column_type;
     std::shared_ptr<const JSONBloomPathMatcher> path_matcher;
-    HashSet<UInt64> hashes;
+    JSONBloomFilterPaths paths;
     size_t total_rows = 0;
 };
 
@@ -82,6 +113,8 @@ public:
         std::shared_ptr<const JSONBloomPathMatcher> path_matcher_);
 
     bool alwaysUnknownOrTrue() const override;
+    bool usesPath(const String & path) const;
+    bool mayBeTrueOnGranule(const MergeTreeIndexGranuleJSONBloomFilter & granule, bool pending_matches) const;
     bool mayBeTrueOnGranule(
         MergeTreeIndexGranulePtr granule,
         const UpdatePartialDisjunctionResultFn & update_partial_result_disjunction_fn) const override;
@@ -106,10 +139,14 @@ private:
 
         Function function;
         String path;
-        std::vector<UInt64> hashes;
-        std::vector<std::vector<UInt64>> alternatives;
+        std::vector<JSONBloomFilterProbe> hashes;
+        std::vector<std::vector<JSONBloomFilterProbe>> alternatives;
     };
 
+    bool evaluateGranule(
+        const MergeTreeIndexGranuleJSONBloomFilter & granule,
+        const UpdatePartialDisjunctionResultFn & update_partial_result_disjunction_fn,
+        bool pending_matches) const;
     bool extractAtomFromTree(const RPNBuilderTreeNode & node, RPNElement & out);
 
     const Block & header;

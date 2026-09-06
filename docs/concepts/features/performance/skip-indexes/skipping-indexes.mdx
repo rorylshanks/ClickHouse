@@ -167,6 +167,8 @@ Data skipping index types based on Bloom filters include:
 
   `include_paths` includes exact paths and their nested paths. `include_paths_regexp` includes paths using partial regular-expression matches. Array elements do not add a path segment, so a field below `items Array(JSON)` has a path such as `items.item_id`. When neither include option is specified, all paths are included. The skip options use the same exact-subtree and partial-match rules and take precedence over the include options. Queries on paths that are not included or are skipped do not use the index.
 
+  Each path has a separate value filter. Queries can avoid reading large filters for paths that their predicates do not use. Runtime type presence is stored separately from the value filters, so Bloom false positives cannot make an absent runtime type appear present.
+
   Runtime `Dynamic` types that cannot be represented by `jsonbf_v1` make predicates on that path conservative. Predicates on other paths can still prune the granule. Complex runtime values add a path-qualified presence token so incompatible predicates on the same path cannot hide an exception.
 
 * The specialized **tokenbf_v1** *(Deprecated)*). It takes three parameters, all related to tuning the bloom filter used:  (1) the size of the filter in bytes (larger filters have fewer false positives, at some cost in storage), (2) number of hash functions applied (again, more hash filters reduce false positives), and (3) the seed for the bloom filter hash functions.  See the calculator [here](https://hur.st/bloomfilter/) for more detail on how these parameters affect bloom filter functionality.
