@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <Columns/ColumnObject.h>
 #include <Core/Field.h>
 #include <DataTypes/DataTypesBinaryEncoding.h>
 #include <DataTypes/DataTypeDateTime64.h>
@@ -23,6 +24,7 @@
 #include <IO/WriteBufferFromString.h>
 #include <IO/ReadBufferFromString.h>
 #include <Common/tests/gtest_global_register.h>
+#include <Common/SipHash.h>
 
 using namespace DB;
 
@@ -159,4 +161,24 @@ GTEST_TEST(DataTypesCache, SerializeDeepDynamicValue)
         EXPECT_NO_THROW(type->getDefaultSerialization()->serializeBinary(*column, 0, ostr, {}));
         EXPECT_NO_THROW(type->getDefaultSerialization()->serializeForHashCalculation(*column, 0, ostr));
     }
+}
+
+GTEST_TEST(DataTypesCache, HashDeepObjectSharedValue)
+{
+    DataTypePtr type = std::make_shared<DataTypeUInt16>();
+    for (size_t i = 0; i < 301; ++i)
+        type = std::make_shared<DataTypeArray>(type);
+
+    /// Populate shared data directly so serializing a `Dynamic` field does not warm the cache.
+    WriteBufferFromOwnString out;
+    encodeDataType(type, out);
+    type->getDefaultSerialization()->serializeBinary(type->getDefault(), out, {});
+    auto object = ColumnObject::create({}, 0, 0);
+    auto [paths, values] = object->getSharedDataPathsAndValues();
+    paths->insertData("a", 1);
+    values->insertData(out.str().data(), out.str().size());
+    object->getSharedDataOffsets().push_back(1);
+
+    SipHash hash;
+    EXPECT_NO_THROW(object->updateHashWithValue(0, hash));
 }
