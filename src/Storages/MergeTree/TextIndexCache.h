@@ -49,12 +49,13 @@ public:
     {
     }
 
-    template <typename... Args>
-    static UInt128 hash(Args... args)
+    static UInt128 hash(std::string_view index_id, std::string_view token)
     {
         SipHash hasher;
         hasher.update(UInt8{0}); /// Token postings, including negative cache entries.
-        (hasher.update(args),...);
+        hasher.update(index_id.size());
+        hasher.update(index_id);
+        hasher.update(token);
         return hasher.get128();
     }
 
