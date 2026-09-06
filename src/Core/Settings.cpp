@@ -4489,7 +4489,9 @@ Possible values:
 If the setting is set to `0`, the table function does not make Nullable columns and inserts default values instead of NULL. This is also applicable for NULL values inside arrays.
 )", 0) \
     DECLARE(Bool, external_table_strict_query, false, R"(
-If it is set to true, transforming expression to local filter is forbidden for queries to external tables.
+If it is set to true, a filter on the columns of an external table (`MySQL`, `PostgreSQL`, `SQLite`, `ODBC`, `JDBC`) that cannot be pushed down to the external database is rejected with an exception instead of being applied locally after the data is fetched.
+
+The check covers the top-level `WHERE` predicate and each conjunct of a top-level `AND`. A `PREWHERE` on the columns of the external table is not a case for this setting: these table engines do not support `PREWHERE`, and such a query is rejected with `ILLEGAL_PREWHERE` regardless of the setting. With the analyzer (the default), the check runs only where a filter could be pushed down at all: when the external table is the only table of the query, on either side of an `INNER JOIN`, or on the preserving side of an outer join (the left side of a `LEFT JOIN`, the right side of a `RIGHT JOIN`). On the non-preserving side of a `LEFT`/`RIGHT JOIN` and on either side of a `FULL JOIN` nothing is pushed down and nothing is checked, so a filter on the columns of the external table is applied locally after the join even in strict mode. Where the check runs, a predicate that references other tables joined in the surrounding query is not pushed down and is excluded from the check, whether it references only the joined side (for example `WHERE r.flag`) or mixes it with the external table inside one non-`AND` expression (for example `WHERE l.id = 1 OR r.flag`); such a predicate keeps its usual ClickHouse evaluation point (`WHERE` after the join, `PREWHERE` before it) and is not rejected. With the old analyzer (`enable_analyzer = 0`) this scoping does not apply: the whole outer filter is checked when the external table is the first table of the join tree, including a predicate on the joined side, and a joined right-hand external table is not checked.
 )", 0) \
     \
     DECLARE(Bool, allow_hyperscan, true, R"(
@@ -8457,6 +8459,16 @@ This happens due to different parsing pipelines:
 DECLARE(Bool, create_if_not_exists, false, R"(
 Enable `IF NOT EXISTS` for `CREATE` statement by default. If either this setting or `IF NOT EXISTS` is specified and a table with the provided name already exists, no exception will be thrown.
 )", 0) \
+    DECLARE(UInt64, create_token_default_ttl_seconds, 1800, R"(
+The lifetime, in seconds, given to a token created by [`CREATE TOKEN`](/reference/statements/create/token) which does not specify its own `VALID UNTIL` or `VALID FOR` clause. The default is 30 minutes, so a token that is not asked to live longer is short-lived.
+
+Possible values:
+
+- Positive integer — the token expires this many seconds after it is created.
+- 0 — a token without an explicit clause never expires.
+
+This is only a default. An explicit `VALID UNTIL` or `VALID FOR` clause of the query always wins, including `VALID UNTIL 'infinity'`, which creates a token that never expires regardless of this setting.
+)", 0) \
     DECLARE(Bool, enforce_strict_identifier_format, false, R"(
 If enabled, only allow identifiers containing alphanumeric characters and underscores.
 )", 0) \
@@ -9239,6 +9251,14 @@ Specifies which JOIN order algorithms to attempt during query plan optimization.
  - 'dpsub' - implements DPsub algorithm which supports both inner and non-inner joins - considers all possible join orders and finds the most optimal one but might be slow for queries with many tables and join predicates.
  - 'dphyp' - implements DPhyp (Dynamic Programming via Hypergraph Partitioning) algorithm currently only for inner joins - explores the same search space as `dpsize` but enumerates only connected subgraph pairs, which generates fewer intermediate joins on sparse join graphs, at the cost of not considering cross products
 Multiple algorithms can be specified as a comma-separated list, e.g. `dphyp,greedy`. They are tried in order; if an algorithm cannot handle the query (e.g. due to outer joins or disconnected components), the next one is used as a fallback.
+)", EXPERIMENTAL) \
+    DECLARE(Bool, query_plan_optimize_join_order_use_cd_a_conflict_detector, false, R"(
+Only affects the `dpsub` join order algorithm. When enabled, DPsub decides which join
+reorderings are valid using the CD-A conflict detector).
+)", EXPERIMENTAL) \
+    DECLARE(Bool, query_plan_optimize_join_order_use_cd_c_conflict_detector, false, R"(
+Only affects the `dpsub` join order algorithm. When enabled, DPsub decides which join reorderings
+are valid using the CD-C conflict detector. Takes precedence over `query_plan_optimize_join_order_use_cd_a_conflict_detector` when both are enabled.
 )", EXPERIMENTAL) \
     DECLARE(Bool, allow_experimental_database_paimon_rest_catalog, false, R"(
 Allow experimental database engine DataLakeCatalog with catalog_type = 'paimon_rest'
