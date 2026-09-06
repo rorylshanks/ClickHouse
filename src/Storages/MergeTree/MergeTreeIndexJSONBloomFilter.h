@@ -2,18 +2,21 @@
 
 #include <Formats/FormatSettings.h>
 #include <Storages/MergeTree/MergeTreeIndexBloomFilter.h>
+#include <set>
 
 namespace DB
 {
 
 class RPNBuilderTreeNode;
 class JSONBloomPathMatcher;
+struct JSONBloomFilterDynamicProbe;
 
 struct JSONBloomFilterProbe
 {
     UInt64 hash;
     bool is_presence = false;
     std::optional<UInt64> required_presence = std::nullopt;
+    std::shared_ptr<const JSONBloomFilterDynamicProbe> dynamic = nullptr;
     auto operator<=>(const JSONBloomFilterProbe &) const = default;
 };
 
@@ -21,6 +24,7 @@ struct JSONBloomFilterTokens
 {
     HashSet<UInt64, TrivialHash> values;
     HashSet<UInt64, TrivialHash> presence;
+    std::map<UInt64, std::set<String>> dynamic_types;
 };
 
 using JSONBloomFilterPaths = std::unordered_map<String, JSONBloomFilterTokens>;
@@ -62,17 +66,23 @@ public:
     bool empty() const override { return !has_rows; }
     size_t memoryUsageBytes() const override;
     bool matches(const String & path, const JSONBloomFilterProbe & probe, bool pending_matches) const;
+    void prepareDynamicProbe(const String & path, const JSONBloomFilterProbe & probe, const FormatSettings & format_settings);
     const JSONBloomPathMatcher & getPathMatcher() const { return *path_matcher; }
 
 private:
     struct PathFilter
     {
+        bool matches(const JSONBloomFilterProbe & probe, bool pending_matches) const;
         std::vector<UInt64> presence;
+        std::vector<std::pair<UInt64, std::vector<String>>> dynamic_types;
+        bool dynamic_types_changed = true;
+        std::unordered_map<std::shared_ptr<const JSONBloomFilterDynamicProbe>, std::vector<JSONBloomFilterProbe>> dynamic_probes;
         BloomFilterPtr values;
         bool present = false;
         bool pending = false;
     };
     std::unordered_map<String, PathFilter> paths;
+    std::unordered_map<std::shared_ptr<const JSONBloomFilterDynamicProbe>, std::unordered_map<String, std::vector<JSONBloomFilterProbe>>> compiled_dynamic_probes;
     size_t bits_per_row;
     size_t hash_functions;
     std::shared_ptr<const JSONBloomPathMatcher> path_matcher;
@@ -114,6 +124,8 @@ public:
 
     bool alwaysUnknownOrTrue() const override;
     bool usesPath(const String & path) const;
+    bool needsDynamicTypes() const { return has_dynamic_probes; }
+    void prepareDynamicProbes(MergeTreeIndexGranuleJSONBloomFilter & granule) const;
     bool mayBeTrueOnGranule(const MergeTreeIndexGranuleJSONBloomFilter & granule, bool pending_matches) const;
     bool mayBeTrueOnGranule(
         MergeTreeIndexGranulePtr granule,
@@ -153,6 +165,7 @@ private:
     std::shared_ptr<const JSONBloomPathMatcher> path_matcher;
     const FormatSettings comparison_format_settings;
     std::vector<RPNElement> rpn;
+    bool has_dynamic_probes = false;
 };
 
 class MergeTreeIndexJSONBloomFilter final : public IMergeTreeIndex
