@@ -1481,25 +1481,76 @@ NameSet MergeTask::getColumnsFullyExpiredByTTL(const GlobalRuntimeContext & glob
     if (global_ctx.ttl_merges_blocker->isCancelled() || !global_ctx.future_part->patch_parts.empty())
         return result;
 
+    /// The renames that are pending for each source part, computed only when needed.
+    std::vector<std::optional<NameSet>> pending_rename_targets(global_ctx.future_part->parts.size());
+    auto is_pending_rename_target = [&](size_t part_index, const String & column)
+    {
+        auto & targets = pending_rename_targets[part_index];
+        if (!targets)
+        {
+            const auto & part = global_ctx.future_part->parts[part_index];
+            MergeTreeData::IMutationsSnapshot::Params params
+            {
+                .metadata_version = global_ctx.metadata_snapshot->getMetadataVersion(),
+                .min_part_metadata_version = part->getMetadataVersion(),
+                .min_part_data_versions = nullptr,
+                .max_mutation_versions = nullptr,
+                .need_data_mutations = false,
+                .need_alter_mutations = false,
+                .need_patch_parts = false,
+            };
+
+            auto alter_conversions = MergeTreeData::getAlterConversionsForPart(part, global_ctx.data->getMutationsSnapshot(params), global_ctx.context
+#if CLICKHOUSE_CLOUD
+                , nullptr
+#endif
+                );
+
+            targets.emplace();
+            for (const auto & rename : alter_conversions->getRenameMap())
+                targets->insert(rename.rename_to);
+        }
+
+        return targets->contains(column);
+    };
+
     for (const auto & [column, _] : global_ctx.metadata_snapshot->getColumnTTLs())
     {
-        bool has_rows = false;
+        bool has_expired_values = false;
         bool is_fully_expired = true;
 
-        for (const auto & part : global_ctx.future_part->parts)
+        for (size_t i = 0; i < global_ctx.future_part->parts.size(); ++i)
         {
+            const auto & part = global_ctx.future_part->parts[i];
             if (part->rows_count == 0)
                 continue;
 
-            has_rows = true;
+            /// A part without the TTL info of the column that does not store the column has no values of it,
+            /// only defaults: the part predates `ADD COLUMN`, or the column has already been dropped from it
+            /// as fully expired, together with its TTL info (see `checkAllTTLCalculated`). Unless the part
+            /// stores the column under its old name, to be renamed on read.
+            if (!part->ttl_infos.columns_ttl.contains(column) && !part->getColumns().contains(column))
+            {
+                if (is_pending_rename_target(i, column))
+                {
+                    is_fully_expired = false;
+                    break;
+                }
+
+                continue;
+            }
+
             if (!part->ttl_infos.isColumnTTLFullyExpired(column, global_ctx.time_of_merge))
             {
                 is_fully_expired = false;
                 break;
             }
+
+            has_expired_values = true;
         }
 
-        if (has_rows && is_fully_expired)
+        /// A column that has no values in any source part is left to the merge, which handles it regardless of TTL.
+        if (has_expired_values && is_fully_expired)
             result.insert(column);
     }
 
