@@ -26,6 +26,7 @@
 #include <Common/Stopwatch.h>
 #include <Common/filesystemHelpers.h>
 #include <Common/getRandomASCIIString.h>
+#include <Common/randomSeed.h>
 #include <Common/logger_useful.h>
 #include <Common/FailPoint.h>
 #include <Common/ErrnoException.h>
@@ -303,59 +304,6 @@ private:
     mutable std::atomic<bool> read_failed = false;
 };
 
-void stampMTimeAfterReplacedVersion(const String & path, const struct stat & replaced_stat);
-
-/// Wrapper around WriteBufferFromFile that adds blob storage logging on finalize.
-/// Inherits from WriteBufferFromFileDecorator to follow the established pattern.
-class WriteBufferFromFileWithLogging final : public WriteBufferFromFileDecorator
-{
-public:
-    WriteBufferFromFileWithLogging(
-        const String & file_path_,
-        size_t buf_size,
-        std::optional<struct stat> replaced_stat_,
-        const String & bucket_,
-        BlobStorageLogWriterPtr blob_log_)
-        : WriteBufferFromFileDecorator(std::make_unique<WriteBufferFromFile>(file_path_, buf_size))
-        , file_path(file_path_)
-        , replaced_stat(std::move(replaced_stat_))
-        , bucket(bucket_)
-        , blob_log(std::move(blob_log_))
-    {
-    }
-
-    std::string getFileName() const override { return file_path; }
-
-private:
-    void finalizeImpl() override
-    {
-        WriteBufferFromFileDecorator::finalizeImpl();
-
-        /// The file was rewritten in place, keeping its inode and possibly its size, so without
-        /// this the new version could keep the etag of the version it replaced.
-        if (replaced_stat)
-            stampMTimeAfterReplacedVersion(file_path, *replaced_stat);
-
-        if (blob_log)
-        {
-            blob_log->addEvent(
-                BlobStorageLogElement::EventType::Upload,
-                /* bucket */ bucket,
-                /* remote_path */ file_path,
-                /* local_path */ {},
-                /* data_size */ count(),
-                /* elapsed_microseconds */ 0,
-                /* error_code */ 0,
-                /* error_message */ {});
-        }
-    }
-
-    const String file_path;
-    const std::optional<struct stat> replaced_stat;
-    const String bucket;
-    BlobStorageLogWriterPtr blob_log;
-};
-
 /// Give the version about to be published a modification time strictly later than
 /// the version it replaces, so that no two versions of a path can ever share an etag.
 ///
@@ -370,16 +318,13 @@ private:
 ///
 /// When all three coincide, the etag of an older version compares equal to the etag
 /// of the current one, so a writer holding the older etag passes the If-Match check
-/// in `publishConditionally` and silently overwrites a newer version - a lost update,
-/// which is precisely what a compare-and-swap must never allow. Publication is
-/// serialized by the exclusive lock on the parent directory, so stamping every
-/// incoming version past the one it replaces makes the mtime - and therefore the
-/// etag - strictly increase across the whole version history of the path, which is
-/// exactly the uniqueness the compare-and-swap needs.
-///
-/// An unconditional write rewrites the file in place, so it keeps the inode of the
-/// replaced version and gets the same stamp: otherwise a same-size rewrite within one
-/// tick would keep the etag, and a reader that trusts it would miss the new content.
+/// in `publishVersion` and silently overwrites a newer version - a lost update, which
+/// is precisely what a compare-and-swap must never allow - and a reader that uses the
+/// etag as a cache key, such as the refresh of a `plain_rewritable` disk, keeps the
+/// content of the older version. Publication is serialized by the exclusive lock on
+/// the parent directory, so stamping every incoming version past the one it replaces
+/// makes the mtime - and therefore the etag - strictly increase across the whole
+/// version history of the path, which is exactly the uniqueness both of them need.
 void stampMTimeAfterReplacedVersion(const String & path, const struct stat & replaced_stat)
 {
     const struct timespec replaced_mtime = getMTime(replaced_stat);
@@ -438,10 +383,46 @@ void stampMTimeAfterReplacedVersion(const String & path, const struct stat & rep
         static_cast<Int64>(replaced_mtime.tv_nsec));
 }
 
-void publishConditionally(const String & temp_path, const String & target_path, const std::optional<String> & if_match_etag)
+/// What has to hold for the path a new version is published under, like the
+/// precondition headers of a PUT to a remote object storage.
+enum class PublishPrecondition : uint8_t
 {
-    if (!if_match_etag.has_value())
+    /// An unconditional write: the new version replaces whichever one is there.
+    None,
+    /// `If-None-Match: *`: the new version may only create the object.
+    IfNoneMatch,
+    /// `If-Match`: the new version may only replace the version with the given etag.
+    IfMatch,
+};
+
+/// Publish the staged version `temp_path` under `target_path` atomically, as a PUT
+/// to a remote object storage does: a reader sees either the replaced version or the
+/// new one, never a partially written object.
+///
+/// Every version is published under the exclusive lock on the parent directory,
+/// whatever its precondition, and is stamped past the version it replaces as that
+/// version stands under the lock (see `stampMTimeAfterReplacedVersion`). This matters
+/// for unconditional writes as much as for conditional ones: two writers racing for
+/// the same path must not both be stamped past the same predecessor, otherwise the
+/// second one could get the etag the first one has already published, and a reader
+/// that trusts the etag would keep the content of the first version.
+void publishVersion(
+    const String & temp_path, const String & target_path, PublishPrecondition precondition, const String & if_match_etag)
+{
+    const String parent_path = fs::path(target_path).parent_path();
+    int dir_fd = ::open(parent_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd < 0)
+        ErrnoException::throwFromPath(ErrorCodes::CANNOT_OPEN_FILE, parent_path, "Cannot open directory {}", parent_path);
+
+    SCOPE_EXIT({ [[maybe_unused]] int err = ::close(dir_fd); });
+
+    if (0 != ::flock(dir_fd, LOCK_EX))
+        ErrnoException::throwFromPath(ErrorCodes::SYSTEM_ERROR, parent_path, "Cannot lock directory {}", parent_path);
+
+    if (precondition == PublishPrecondition::IfNoneMatch)
     {
+        /// Unlike `rename`, `link` never replaces an existing target, so the check and
+        /// the publication are a single atomic step. There is no version to stamp past.
         if (0 == ::link(temp_path.c_str(), target_path.c_str()))
             return;
 
@@ -454,60 +435,57 @@ void publishConditionally(const String & temp_path, const String & target_path, 
         ErrnoException::throwFromPath(ErrorCodes::CANNOT_LINK, target_path, "Cannot link {} to {}", temp_path, target_path);
     }
 
-    const String parent_path = fs::path(target_path).parent_path();
-    int dir_fd = ::open(parent_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (dir_fd < 0)
-        ErrnoException::throwFromPath(ErrorCodes::CANNOT_OPEN_FILE, parent_path, "Cannot open directory {}", parent_path);
-
-    SCOPE_EXIT({ [[maybe_unused]] int err = ::close(dir_fd); });
-
-    if (0 != ::flock(dir_fd, LOCK_EX))
-        ErrnoException::throwFromPath(ErrorCodes::SYSTEM_ERROR, parent_path, "Cannot lock directory {}", parent_path);
-
     struct stat file_stat{};
-    if (0 != ::stat(target_path.c_str(), &file_stat))
+    const bool target_exists = (0 == ::stat(target_path.c_str(), &file_stat));
+    if (!target_exists && errno != ENOENT)
+        ErrnoException::throwFromPath(ErrorCodes::CANNOT_STAT, target_path, "Cannot stat file {}", target_path);
+
+    if (precondition == PublishPrecondition::IfMatch)
     {
-        if (errno == ENOENT)
+        if (!target_exists)
             throw Exception(
                 ErrorCodes::STALE_VERSION,
                 "Object {} does not exist, PreconditionFailed for If-Match: {}",
-                target_path, *if_match_etag);
+                target_path, if_match_etag);
 
-        ErrnoException::throwFromPath(ErrorCodes::CANNOT_STAT, target_path, "Cannot stat file {}", target_path);
+        if (auto etag = makeETag(file_stat); etag != if_match_etag)
+            throw Exception(
+                ErrorCodes::STALE_VERSION,
+                "Object {} was modified concurrently (etag {}, expected {}), PreconditionFailed for If-Match",
+                target_path, etag, if_match_etag);
     }
 
-    if (auto etag = makeETag(file_stat); etag != *if_match_etag)
-        throw Exception(
-            ErrorCodes::STALE_VERSION,
-            "Object {} was modified concurrently (etag {}, expected {}), PreconditionFailed for If-Match",
-            target_path, etag, *if_match_etag);
-
-    stampMTimeAfterReplacedVersion(temp_path, file_stat);
+    if (target_exists)
+        stampMTimeAfterReplacedVersion(temp_path, file_stat);
 
     if (0 != ::rename(temp_path.c_str(), target_path.c_str()))
         ErrnoException::throwFromPath(ErrorCodes::SYSTEM_ERROR, target_path, "Cannot rename {} to {}", temp_path, target_path);
 }
 
-class WriteBufferToConditionallyPublishedFile final : public WriteBufferFromFileDecorator
+/// Stages the written data in a temporary file next to the target, and publishes it
+/// with `publishVersion` on finalization. A cancelled write leaves the object as it was.
+class WriteBufferToPublishedFile final : public WriteBufferFromFileDecorator
 {
 public:
-    WriteBufferToConditionallyPublishedFile(
+    WriteBufferToPublishedFile(
         const String & target_path_,
         const String & temp_path_,
         size_t buf_size,
-        std::optional<String> if_match_etag_,
+        PublishPrecondition precondition_,
+        String if_match_etag_,
         const String & bucket_,
         BlobStorageLogWriterPtr blob_log_)
         : WriteBufferFromFileDecorator(std::make_unique<WriteBufferFromFile>(temp_path_, buf_size, O_WRONLY | O_CREAT | O_EXCL))
         , target_path(target_path_)
         , temp_path(temp_path_)
+        , precondition(precondition_)
         , if_match_etag(std::move(if_match_etag_))
         , bucket(bucket_)
         , blob_log(std::move(blob_log_))
     {
     }
 
-    ~WriteBufferToConditionallyPublishedFile() override
+    ~WriteBufferToPublishedFile() override
     {
         removeTemporaryFile();
     }
@@ -520,7 +498,7 @@ private:
         WriteBufferFromFileDecorator::finalizeImpl();
 
         const size_t data_size = count();
-        publishConditionally(temp_path, target_path, if_match_etag);
+        publishVersion(temp_path, target_path, precondition, if_match_etag);
         removeTemporaryFile();
 
         if (blob_log)
@@ -552,7 +530,8 @@ private:
 
     const String target_path;
     const String temp_path;
-    const std::optional<String> if_match_etag;
+    const PublishPrecondition precondition;
+    const String if_match_etag;
     const String bucket;
     BlobStorageLogWriterPtr blob_log;
     bool temporary_file_removed = false;
@@ -614,46 +593,44 @@ std::unique_ptr<WriteBufferFromFileBase> LocalObjectStorage::writeObject( /// NO
     if (!if_none_match.empty() && !if_match.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "If-None-Match and If-Match cannot be used together for object {}", object.remote_path);
 
-    if (!if_none_match.empty() || !if_match.empty())
+    auto precondition = PublishPrecondition::None;
+    if (!if_none_match.empty())
     {
-        if (!if_none_match.empty() && if_none_match != "*")
+        if (if_none_match != "*")
             throw Exception(
                 ErrorCodes::BAD_ARGUMENTS,
                 "Local object storage supports only `*` for If-None-Match, got `{}`",
                 if_none_match);
 
-        std::optional<String> if_match_etag;
-        if (!if_match.empty())
-            if_match_etag = if_match;
-
-        /// Both filenames have to come out of `resolved_path`, exactly like the
-        /// unconditional write below: a key relative to `settings.key_prefix` would
-        /// otherwise be staged and published under the server's working directory,
-        /// giving conditional writes a different notion of a key than every other
-        /// method of this storage.
-        auto target_path = fs::path(resolved_path);
-        auto temp_path = target_path.parent_path() / fmt::format(".tmp_{}_{}", target_path.filename().string(), getRandomASCIIString(8));
-
-        return std::make_unique<WriteBufferToConditionallyPublishedFile>(
-            resolved_path,
-            temp_path,
-            buf_size,
-            std::move(if_match_etag),
-            settings.key_prefix,
-            std::move(blob_storage_log));
+        precondition = PublishPrecondition::IfNoneMatch;
+    }
+    else if (!if_match.empty())
+    {
+        precondition = PublishPrecondition::IfMatch;
     }
 
-    /// The existing version is truncated when the file is opened, so remember its modification time now.
-    std::optional<struct stat> replaced_stat;
-    if (struct stat file_stat{}; 0 == ::stat(resolved_path.c_str(), &file_stat))
-        replaced_stat = file_stat;
-    else if (errno != ENOENT)
-        ErrnoException::throwFromPath(ErrorCodes::CANNOT_STAT, resolved_path, "Cannot stat file {}", resolved_path);
+    /// Even an unconditional write is staged and then published by `rename`, never
+    /// written in place: the etag is `(mtime, inode, size)`, and only publishing under
+    /// the lock of `publishVersion` keeps it unique to one version of the object.
+    ///
+    /// Both filenames have to come out of `resolved_path`: a key relative to
+    /// `settings.key_prefix` would otherwise be staged and published under the
+    /// server's working directory, giving writes a different notion of a key than
+    /// every other method of this storage.
+    ///
+    /// The staging name is drawn from a generator of its own, so that staging a write
+    /// does not advance `thread_local_rng`, which object keys are generated from.
+    static thread_local pcg64 staging_name_rng(randomSeed());
+    auto target_path = fs::path(resolved_path);
+    auto temp_path = target_path.parent_path()
+        / fmt::format(".tmp_{}_{}", target_path.filename().string(), getRandomASCIIString(8, staging_name_rng));
 
-    return std::make_unique<WriteBufferFromFileWithLogging>(
+    return std::make_unique<WriteBufferToPublishedFile>(
         resolved_path,
+        temp_path,
         buf_size,
-        std::move(replaced_stat),
+        precondition,
+        if_match,
         settings.key_prefix,
         std::move(blob_storage_log));
 }
