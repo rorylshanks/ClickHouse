@@ -140,7 +140,7 @@ Supported values:
 - `polyglot` — transpiles SQL from other dialects (MySQL, PostgreSQL, etc.) into ClickHouse SQL. Requires the experimental setting `allow_experimental_polyglot_dialect`.
 - `promql` — PromQL (Prometheus Query Language) evaluated over a TimeSeries table, configured by the `promql_database`, `promql_table`, and `promql_evaluation_time` settings.
 - `clickhouse_json` — instead of SQL text, the query is interpreted as a JSON AST (the output of `parseQueryToJSON`). The `SET` query is still recognized in plain form so that the dialect can be switched back. Requires the experimental setting `enable_json_ast_dialect`.
-- `logsql` — LogsQL, the log query language of VictoriaLogs, translated into `SELECT` queries over the logs table configured by the `logsql_database` and `logsql_table` settings. Requires the experimental setting `allow_experimental_logsql_dialect`.
+- `logsql` — LogsQL, the log query language of VictoriaLogs, translated into `SELECT` queries over the logs table configured by the `logsql_database` and `logsql_table` settings. Requires the experimental setting `enable_logsql_dialect`.
 - `trino` — Trino SQL: translates Trino syntax (`ARRAY[...]`, `TRY_CAST`, `UNNEST`, ...) and maps Trino function names to their ClickHouse equivalents. Requires the experimental setting `enable_trino_dialect`.
 )", 0)\
     DECLARE(UInt64, min_compress_block_size, 65536, R"(
@@ -9369,7 +9369,8 @@ Uses replicas from cluster_for_parallel_replicas.
 - [distributed_index_analysis_for_non_shared_merge_tree](#distributed_index_analysis_for_non_shared_merge_tree)
 - [distributed_index_analysis_min_parts_to_activate](/reference/settings/merge-tree-settings/distributed-index#distributed_index_analysis_min_parts_to_activate)
 - [distributed_index_analysis_min_indexes_bytes_to_activate](/reference/settings/merge-tree-settings/distributed-index#distributed_index_analysis_min_indexes_bytes_to_activate)
-)", EXPERIMENTAL, \
+)", BETA, \
+        {"26.10", false, false, "Distributed index analysis was moved to Beta."}, \
         {"26.1", false, false, "New experimental setting"}) \
     DECLARE(Bool, distributed_index_analysis_only_on_coordinator, false, R"(
 If enabled, distributed index analysis runs only on the coordinator.
@@ -10021,9 +10022,10 @@ materialized during inserts and background merges instead of rewriting the histo
 Enable transforming the payload of a hash join into a row-major layout.
 )", 0, \
         {"26.9", false, true, "New setting to enable transforming the payload of a hash join into a row-major layout."}) \
-    DECLARE(Double, min_rows_ratio_for_hash_join_row_store, 5.0, R"(
+    DECLARE(Double, min_rows_ratio_for_hash_join_row_store, 3.0, R"(
 Minimum estimated ratio of join output rows to build-side rows to enable transforming hash join payload to row-major. 0 means the transformation is always allowed.
 )", 0, \
+        {"26.10", 5.0, 3.0, "Lowered the minimum estimated ratio of join output rows to build-side rows that enables the hash join row store."}, \
         {"26.9", 5.0, 5.0, "New setting to control the minimum estimated ratio of join output rows to build-side rows to enable transforming hash join payload to row-major. 0 means the transformation is always allowed."}) \
     \
     /* ####################################################### */ \
@@ -10363,12 +10365,12 @@ SET dialect = 'clickhouse_json';
 Source SQL dialect for the polyglot transpiler (e.g. 'sqlite', 'mysql', 'postgresql', 'snowflake', 'duckdb').
 )", EXPERIMENTAL, \
         {"26.3", "", "", "New setting to specify the source SQL dialect for the polyglot transpiler."}) \
-    DECLARE(Bool, allow_experimental_logsql_dialect, false, R"(
+    DECLARE(Bool, enable_logsql_dialect, false, R"(
 Enable LogsQL - the log query language of VictoriaLogs. Queries in this dialect are translated into SELECT queries over the table specified by the `logsql_table` setting.
 
 Usage:
 ```sql
-SET allow_experimental_logsql_dialect = 1;
+SET enable_logsql_dialect = 1;
 SET logsql_table = 'logs';
 SET dialect = 'logsql';
 
