@@ -1497,7 +1497,7 @@ void insertVariantValueIntoTypedColumn(
             return;
         }
 
-        auto casted = castColumn({std::move(source_column), source_type, "__parquet_variant_value"}, type);
+        auto casted = castColumn({source_column, source_type, "__parquet_variant_value"}, type);
         column.insertFrom(*casted->convertToFullColumnIfConst(), 0);
         return;
     }

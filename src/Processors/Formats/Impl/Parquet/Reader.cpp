@@ -33,8 +33,6 @@
 #include <DataTypes/DataTypesDecimal.h>
 #include <DataTypes/NestedUtils.h>
 #include <DataTypes/TypeTree.h>
-#include <Common/FieldAccurateComparison.h>
-#include <Common/checkStackSize.h>
 #include <Formats/FormatFilterInfo.h>
 #include <Formats/SchemaInferenceUtils.h>
 #include <Functions/FunctionTopKFilter.h>
