@@ -510,6 +510,9 @@ struct Reader
 
         std::vector<OutputColumnState> output; // parallel to extended_sample_block
         std::vector<ColumnPtr> formed_output_columns; // parallel to output_columns
+        /// Parallel to `formed_output_columns`: whether the cached column was formed inside an
+        /// `Array`, so it has one row per array element rather than per row of the subgroup.
+        std::vector<UInt8> formed_output_columns_inside_array;
         std::vector<ColumnPtr> formed_parsed_object_source_columns; // parallel to parsed_object_sources
         std::vector<std::shared_ptr<VariantReader::MetadataState>> variant_metadata_states; // parallel to shared metadata state slots
         std::vector<std::shared_ptr<VariantReader::SourceState>> variant_source_states; // parallel to shared variant source state slots

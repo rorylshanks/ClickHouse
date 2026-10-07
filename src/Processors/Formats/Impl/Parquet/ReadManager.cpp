@@ -1085,6 +1085,7 @@ void ReadManager::clearRowSubgroup(RowSubgroup & row_subgroup, MemoryUsageDiff &
     row_subgroup.filter.clear(&diff);
     row_subgroup.output.clear();
     row_subgroup.formed_output_columns.clear();
+    row_subgroup.formed_output_columns_inside_array.clear();
     row_subgroup.formed_parsed_object_source_columns.clear();
     row_subgroup.variant_metadata_states.clear();
     row_subgroup.variant_source_states.clear();

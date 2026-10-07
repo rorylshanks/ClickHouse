@@ -2636,6 +2636,7 @@ void Reader::intersectColumnIndexResultsAndInitSubgroups(RowGroup & row_group)
             row_subgroup.columns.resize(primitive_columns.size());
             row_subgroup.output = std::vector<OutputColumnState>(extended_sample_block.columns());
             row_subgroup.formed_output_columns = std::vector<ColumnPtr>(output_columns.size());
+            row_subgroup.formed_output_columns_inside_array = std::vector<UInt8>(output_columns.size());
             row_subgroup.formed_parsed_object_source_columns = std::vector<ColumnPtr>(parsed_object_sources.size());
             row_subgroup.variant_metadata_states = std::vector<std::shared_ptr<VariantReader::MetadataState>>(variant_metadata_state_slots);
             row_subgroup.variant_source_states = std::vector<std::shared_ptr<VariantReader::SourceState>>(variant_source_state_slots);
@@ -3751,6 +3752,7 @@ void Reader::cacheOutputColumn(RowSubgroup & row_subgroup, size_t output_column_
         return;
 
     cached_output = column;
+    row_subgroup.formed_output_columns_inside_array[output_column_idx] = !row_subgroup.nested_array_offsets.empty();
 
     if (output_info.idx_in_output_block.has_value())
     {
@@ -4180,6 +4182,15 @@ void Reader::applyPrewhere(RowSubgroup & row_subgroup, const RowGroup & row_grou
             ColumnPtr & cached_output = row_subgroup.formed_output_columns[output_idx];
             if (!cached_output)
                 continue;
+
+            /// An output formed inside an `Array` has a row per array element, so the row filter
+            /// does not apply to it. It was only needed to form its enclosing output, which is
+            /// cached at the row level and filtered here, so drop it.
+            if (row_subgroup.formed_output_columns_inside_array[output_idx])
+            {
+                cached_output = nullptr;
+                continue;
+            }
 
             const auto & output_info = output_columns.at(output_idx);
             if (output_info.idx_in_output_block.has_value())
