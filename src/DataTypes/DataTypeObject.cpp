@@ -36,11 +36,6 @@
 namespace DB
 {
 
-bool containsObjectType(const IDataType & type)
-{
-    return anyInTypeTree(type, [](const IDataType & node) { return isObject(node); });
-}
-
 namespace ErrorCodes
 {
     extern const int UNEXPECTED_AST_STRUCTURE;

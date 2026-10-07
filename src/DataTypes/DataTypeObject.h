@@ -141,6 +141,5 @@ private:
     bool has_timezone_dependent_typed_paths = false;
 };
 
-bool containsObjectType(const IDataType & type);
 
 }
