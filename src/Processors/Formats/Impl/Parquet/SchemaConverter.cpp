@@ -1005,7 +1005,14 @@ bool SchemaConverter::processSubtreePrimitive(TraversalNode & node)
     DataTypePtr primitive_column_type = primitive_decoded_type;
     DataTypePtr primitive_output_type = primitive_decoded_type;
     DataTypePtr low_cardinality_dictionary_type;
-    if (low_cardinality_dictionary_type_hint && low_cardinality_dictionary_type_hint->equals(*primitive_decoded_type))
+    /// An integer column read as `Bool` is decoded as `UInt8` (which `equals` `Bool`) and keeps its
+    /// stored values (e.g. 2); only the cast into `LowCardinality(Bool)` normalizes them to 0 and 1.
+    /// Inserting the decoded values directly into the `LowCardinality` dictionary would skip that
+    /// cast, so it is done only for `BOOLEAN` columns.
+    const bool decoded_bool_needs_normalization = low_cardinality_dictionary_type_hint
+        && isBool(removeNullable(low_cardinality_dictionary_type_hint)) && node.element->type != parq::Type::BOOLEAN;
+    if (low_cardinality_dictionary_type_hint && low_cardinality_dictionary_type_hint->equals(*primitive_decoded_type)
+        && !decoded_bool_needs_normalization)
     {
         low_cardinality_dictionary_type = primitive_decoded_type;
         if (primitive_output_nullable)
