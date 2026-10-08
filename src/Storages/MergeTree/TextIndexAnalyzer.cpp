@@ -167,6 +167,20 @@ void TextIndexAnalyzer::QueryBuilder::addPostings(std::string_view token, const 
         markFailed();
 }
 
+FlatPostingsPtr TextIndexAnalyzer::QueryBuilder::getFlatPostings() const
+{
+    chassert(postings);
+
+    std::call_once(flat_postings_once, [&]
+    {
+        auto flat = std::make_shared<PaddedPODArray<UInt32>>(postings->cardinality());
+        postings->toUint32Array(flat->data());
+        flat_postings = std::move(flat);
+    });
+
+    return flat_postings;
+}
+
 TextIndexAnalyzer::TextIndexAnalyzer(
     const MergeTreeIndexConditionText & condition_text,
     const std::optional<JSONPathValues::IndexConfiguration> & part_configuration)
