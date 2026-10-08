@@ -32,9 +32,16 @@ for _ in {1..30}; do
     $CLICKHOUSE_CLIENT -q "SYSTEM STOP MERGES t_read_thread_cancel"
 done
 
+$CLICKHOUSE_CLIENT -q "SYSTEM START MERGES t_read_thread_cancel"
+
+# `OPTIMIZE FINAL` does nothing while a background merge holds the parts, so repeat it until one part is left.
+for _ in {1..600}; do
+    $CLICKHOUSE_CLIENT -q "OPTIMIZE TABLE t_read_thread_cancel FINAL"
+    [[ $($CLICKHOUSE_CLIENT -q "SELECT count() FROM system.parts WHERE database = currentDatabase() AND table = 't_read_thread_cancel' AND active") == 1 ]] && break
+    sleep 0.1
+done
+
 $CLICKHOUSE_CLIENT -q "
-    SYSTEM START MERGES t_read_thread_cancel;
-    OPTIMIZE TABLE t_read_thread_cancel FINAL;
     SELECT count(), sum(id), countIf(s1 = repeat(toString(id), 20)) FROM t_read_thread_cancel;
     SELECT count() FROM system.parts WHERE database = currentDatabase() AND table = 't_read_thread_cancel' AND active;
     DROP TABLE t_read_thread_cancel;

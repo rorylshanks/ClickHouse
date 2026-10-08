@@ -34,14 +34,26 @@ MergeHelperThreads::SlotPtr MergeHelperThreads::tryAcquire()
     size_t used = used_threads.load(std::memory_order_relaxed);
     do
     {
-        if (used >= max_threads.load(std::memory_order_relaxed))
+        size_t max = max_threads.load(std::memory_order_relaxed);
+        if (used >= max)
         {
-            ProfileEvents::increment(ProfileEvents::MergeHelperThreadUnavailable);
+            /// Zero disables the threads, so they are not unavailable.
+            if (max)
+                ProfileEvents::increment(ProfileEvents::MergeHelperThreadUnavailable);
             return nullptr;
         }
     } while (!used_threads.compare_exchange_weak(used, used + 1, std::memory_order_relaxed));
 
-    return SlotPtr(new Slot);
+    /// The thread is already counted, and only the destructor of the slot releases it.
+    try
+    {
+        return SlotPtr(new Slot);
+    }
+    catch (...)
+    {
+        used_threads.fetch_sub(1, std::memory_order_relaxed);
+        throw;
+    }
 }
 
 void MergeHelperThreads::setMaxThreads(size_t max_threads_)
