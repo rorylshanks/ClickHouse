@@ -3613,8 +3613,8 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
             /// Build the header from the DAG inputs: during projection analysis the PREWHERE still refers to
             /// the parent table columns, which the projection metadata does not have.
             ColumnsWithTypeAndName inputs;
-            for (const auto & [name, type] : prewhere_actions.getRequiredColumns())
-                inputs.emplace_back(type->createColumn(), type, name);
+            for (const auto & column : prewhere_actions.getRequiredColumns())
+                inputs.emplace_back(column.type->createColumn(), column.type, column.name);
             auto header = prewhere_actions.updateHeader(Block(std::move(inputs)));
             const auto & filter_column = header.getByName(prewhere_column_name).column;
             always_false = filter_column && ConstantFilterDescription(*filter_column).always_false;
