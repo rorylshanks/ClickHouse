@@ -327,7 +327,7 @@ enum class JSONBloomDomain : UInt8
     DynamicComplexPresence = 5,
 };
 
-void updateTokenHash(XXH3_state_t & hash, std::string_view value)
+void updateTokenHash(XXH_INLINE_XXH3_state_t & hash, std::string_view value)
 {
     UInt64 size = value.size();
     transformEndianness<std::endian::little>(size);
@@ -346,7 +346,7 @@ UInt64 hashToken(std::string_view path, JSONBloomRole role, JSONBloomDomain doma
     /// Native numeric equality uses the existing `Int64` token layout.
     if (domain == JSONBloomDomain::Typed && usesNumericToken(type))
         type = "Int64";
-    XXH3_state_t hash;
+    XXH_INLINE_XXH3_state_t hash;
     XXH_INLINE_XXH3_64bits_reset(&hash);
     static constexpr std::string_view namespace_name = "jsonbf_v1";
     updateTokenHash(hash, namespace_name);
