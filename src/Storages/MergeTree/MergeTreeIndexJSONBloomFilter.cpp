@@ -3210,7 +3210,7 @@ bool MergeTreeIndexConditionJSONBloomFilter::extractAtomFromTree(const RPNBuilde
         auto future_set = function.getArgumentAt(1).tryGetPreparedSet();
         if (!future_set)
             return false;
-        auto prepared_set = future_set->buildOrderedSetInplace(function.getArgumentAt(1).getTreeContext().getQueryContext());
+        auto prepared_set = future_set->buildOrderedSetInplace(function.getArgumentAt(1).getContext());
         if (!prepared_set || !prepared_set->hasExplicitSetElements())
             return false;
         const auto set_columns = prepared_set->getSetElements();
