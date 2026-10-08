@@ -1,4 +1,4 @@
--- Tags: no-parallel
+-- Tags: no-parallel, no-fasttest
 -- no-parallel: enables a failpoint, which affects merges of other tables.
 
 -- An exception in the thread that reads the columns of a Vertical merge fails the merge,
