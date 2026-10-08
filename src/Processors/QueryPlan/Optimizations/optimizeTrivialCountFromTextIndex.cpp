@@ -21,7 +21,6 @@
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/MergeTreeIndexConditionText.h>
-#include <Storages/MergeTree/MergeTreeIndexReader.h>
 #include <Storages/MergeTree/RangesInDataPart.h>
 #include <Storages/MergeTree/TextIndexUtils.h>
 
@@ -389,9 +388,10 @@ bool optimizeTrivialCountFromTextIndex(QueryPlan::Node & node, QueryPlan::Nodes 
         const auto & regular = index_format.substreams.front();
         auto stream = makeTextIndexInputStream(
             part_with_ranges.data_part->getDataPartStoragePtr(),
-            text_index.getFileName() + regular.suffix,
-            regular.extension,
-            MergeTreeIndexReader::patchSettings(matched->reading->getReaderSettings(), regular.type));
+            text_index.getFileName(),
+            regular,
+            matched->reading->getReaderSettings(),
+            /*expected_buffer_size=*/ std::nullopt);
         stream->seekToStart();
         auto header = TextIndexSerialization::deserializeHeaderPrefix(*stream->getDataBuffer());
         return search_query->condition->canUseQueryWithPartConfiguration(

@@ -269,10 +269,7 @@ bool canReuseTextIndexForMerge(
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Text index {} does not have a regular stream", index->index.name);
 
     auto stream = makeTextIndexInputStream(
-        part.getDataPartStoragePtr(),
-        index->getFileName() + regular->suffix,
-        regular->extension,
-        MergeTreeIndexReader::patchSettings(reader_settings, regular->type));
+        part.getDataPartStoragePtr(), index->getFileName(), *regular, reader_settings, /*expected_buffer_size=*/ std::nullopt);
     stream->seekToStart();
     auto source_header = TextIndexSerialization::deserializeHeaderPrefix(*stream->getDataBuffer());
 
