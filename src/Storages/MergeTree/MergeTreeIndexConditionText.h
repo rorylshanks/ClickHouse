@@ -6,7 +6,6 @@
 #include <Common/OptimizedRegularExpression.h>
 #include <Common/VectorWithMemoryTracking.h>
 #include <Functions/JSONPathValues.h>
-#include <Storages/MergeTree/MergeTreeIndexJSONSubcolumnHelper.h>
 
 namespace DB
 {
