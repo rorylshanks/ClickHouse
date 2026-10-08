@@ -284,7 +284,7 @@ namespace Setting
     extern const SettingsBool enable_vertical_final;
     extern const SettingsBool force_aggregate_partitions_independently;
     extern const SettingsBool force_creating_set_partitions_independently;
-    extern const SettingsString force_data_skipping_indices;
+    extern const SettingsString force_data_skipping_indexes;
     extern const SettingsBool force_distinct_partitions_independently;
     extern const SettingsBool force_window_partitions_independently;
     extern const SettingsBool force_primary_key;
@@ -3599,7 +3599,7 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
     /// A forced data-skipping index still needs the granule analysis below to verify that it was used.
     if (query_info_.prewhere_info
         && settings[Setting::enable_early_constant_folding]
-        && !settings[Setting::force_data_skipping_indices].changed
+        && !settings[Setting::force_data_skipping_indexes].changed
         && query_info_.prewhere_info->prewhere_actions.isSuitableForConstantFolding())
     {
         const auto & prewhere_actions = query_info_.prewhere_info->prewhere_actions;
