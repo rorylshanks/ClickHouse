@@ -14,6 +14,7 @@
 #include <DataTypes/DataTypeObject.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <DataTypes/TypeTree.h>
 #include <Functions/FunctionHelpers.h>
 #include <Functions/JSONPathValues.h>
 #include <Functions/MultiSearchImpl.h>
@@ -43,31 +44,19 @@ namespace Setting
 
 static bool containsFloat(const IDataType & type)
 {
-    if (WhichDataType(type).isFloat())
-        return true;
-
-    bool result = false;
-    type.forEachChild([&](const IDataType & child)
-    {
-        result |= containsFloat(child);
-    });
-    return result;
+    return anyInTypeTree(type, [](const IDataType & current_type) { return WhichDataType(current_type).isFloat(); });
 }
 
 static bool hasStableJSONPathValuesSerialization(const IDataType & type)
 {
-    bool result = true;
-    auto check = [&](const IDataType & current_type)
+    return !anyInTypeTree(type, [](const IDataType & current_type)
     {
         if (const auto * date_time = typeid_cast<const DataTypeDateTime *>(&current_type))
-            result &= date_time->hasExplicitTimeZone();
-        else if (const auto * date_time64 = typeid_cast<const DataTypeDateTime64 *>(&current_type))
-            result &= date_time64->hasExplicitTimeZone();
-    };
-
-    check(type);
-    type.forEachChild(check);
-    return result;
+            return !date_time->hasExplicitTimeZone();
+        if (const auto * date_time64 = typeid_cast<const DataTypeDateTime64 *>(&current_type))
+            return !date_time64->hasExplicitTimeZone();
+        return false;
+    });
 }
 
 static String escapeLikePatternLiteral(std::string_view value)
@@ -86,8 +75,8 @@ static String escapeLikePatternLiteral(std::string_view value)
 static OptimizedRegularExpression createJSONValuePattern(const String & value_pattern, bool case_insensitive)
 {
     if (case_insensitive)
-        return Regexps::createRegexp<true, true, true>(value_pattern);
-    return Regexps::createRegexp<true, true, false>(value_pattern);
+        return Regexps::createRegexp<true, false, true, true>(value_pattern);
+    return Regexps::createRegexp<true, false, true, false>(value_pattern);
 }
 
 static String createJSONTokenPrefix(
@@ -785,8 +774,8 @@ bool MergeTreeIndexConditionText::traverseJSONPathValuesFunction(
     {
         const bool case_insensitive = function_name == "ilike";
         if ((case_insensitive
-                ? Regexps::createRegexp</*like=*/ true, /*no_capture=*/ true, /*case_insensitive=*/ true>(value).match("", 0)
-                : Regexps::createRegexp</*like=*/ true, /*no_capture=*/ true, /*case_insensitive=*/ false>(value).match("", 0)))
+                ? Regexps::createRegexp</*like=*/ true, /*similar_to=*/ false, /*no_capture=*/ true, /*case_insensitive=*/ true>(value).match("", 0)
+                : Regexps::createRegexp</*like=*/ true, /*similar_to=*/ false, /*no_capture=*/ true, /*case_insensitive=*/ false>(value).match("", 0)))
             return false;
 
         auto prefix = extractFixedPrefixFromLikePattern(value, true);
@@ -797,7 +786,7 @@ bool MergeTreeIndexConditionText::traverseJSONPathValuesFunction(
 
     if (function_name == "match")
     {
-        if (Regexps::createRegexp</*like=*/ false, /*no_capture=*/ true, /*case_insensitive=*/ false>(value).match("", 0))
+        if (Regexps::createRegexp</*like=*/ false, /*similar_to=*/ false, /*no_capture=*/ true, /*case_insensitive=*/ false>(value).match("", 0))
             return false;
 
         const auto analysis = OptimizedRegularExpression::analyze(value);
