@@ -1473,8 +1473,8 @@ void SerializationMap::collectLowCardinalityFromBucketsWithOrder(
 
 #ifdef DEBUG_OR_SANITIZER_BUILD
             auto check = column_dictionary.cloneEmpty();
-            const auto & dictionary_values = *assert_cast<const IColumnUnique &>(*dictionary).getNestedColumn();
-            assert_cast<IColumnUnique &>(*check).uniqueInsertRangeFrom(dictionary_values, 0, dictionary_values.size());
+            const auto & dictionary_values = *static_cast<const IColumnUnique &>(*dictionary).getNestedColumn();
+            static_cast<IColumnUnique &>(*check).uniqueInsertRangeFrom(dictionary_values, 0, dictionary_values.size());
             if (check->size() != dictionary->size())
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Dictionaries of the keys of the buckets of a Map have common values");
 #endif
@@ -1482,7 +1482,7 @@ void SerializationMap::collectLowCardinalityFromBucketsWithOrder(
         else
         {
             dictionary = column_dictionary.cloneEmpty();
-            auto & dictionary_unique = assert_cast<IColumnUnique &>(*dictionary);
+            auto & dictionary_unique = static_cast<IColumnUnique &>(*dictionary);
             for (size_t bucket = 0; bucket != num_buckets; ++bucket)
             {
                 const auto & bucket_dictionary = *bucket_columns[bucket]->getDictionary().getNestedColumn();
