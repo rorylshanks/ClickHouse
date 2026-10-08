@@ -529,12 +529,12 @@ Search tokens that the postprocessor maps to an empty string are ignored, i.e. t
 | Function | Supports a preprocessor | Compatible tokenizers⁵ | Supports a postprocessor |
 |---|---|---|---|
 | `=` | yes⁴ | all | yes⁴ |
-| `IN` | yes⁴ | all | yes⁴ |
-| [hasToken](/reference/functions/regular-functions/string-search-functions#hasToken)                   | yes | all (designed for `splitByNonAlpha`) | yes |
-| [hasAnyTokens(col, str)](/reference/functions/regular-functions/string-search-functions#hasAnyTokens) | yes | all | yes |
-| [hasAllTokens(col, str)](/reference/functions/regular-functions/string-search-functions#hasAllTokens) | yes | all | yes |
-| [hasAnyTokens(col, arr)](/reference/functions/regular-functions/string-search-functions#hasAnyTokens) | no (array elements are tokens as-is) | all | yes |
-| [hasAllTokens(col, arr)](/reference/functions/regular-functions/string-search-functions#hasAllTokens) | no (array elements are tokens as-is) | all | yes |
+| `IN` | yes⁴ | all⁶ | yes⁴ |
+| [hasToken](/reference/functions/regular-functions/string-search-functions#hasToken)                   | yes | all except `jsonPathValues` (designed for `splitByNonAlpha`) | yes |
+| [hasAnyTokens(col, str)](/reference/functions/regular-functions/string-search-functions#hasAnyTokens) | yes | all except `jsonPathValues` | yes |
+| [hasAllTokens(col, str)](/reference/functions/regular-functions/string-search-functions#hasAllTokens) | yes | all except `jsonPathValues` | yes |
+| [hasAnyTokens(col, arr)](/reference/functions/regular-functions/string-search-functions#hasAnyTokens) | no (array elements are tokens as-is) | all except `jsonPathValues` | yes |
+| [hasAllTokens(col, arr)](/reference/functions/regular-functions/string-search-functions#hasAllTokens) | no (array elements are tokens as-is) | all except `jsonPathValues` | yes |
 | [hasPhrase](/reference/functions/regular-functions/string-search-functions#hasPhrase)                 | yes | `splitByNonAlpha`, `splitByString`, `splitByRegexp`³, `ngrams`, `asciiCJK`, `icu` | yes³ |
 | [startsWith](/reference/functions/regular-functions/string-functions#startsWith)                      | yes⁴⁵ | `splitByNonAlpha`, `ngrams`, `sparseGrams`, `asciiCJK`, `array`⁵, `jsonPathValues`⁴ | yes⁴⁵ |
 | [endsWith](/reference/functions/regular-functions/string-functions#endsWith)                          | yes⁴⁵ | `splitByNonAlpha`, `ngrams`, `sparseGrams`, `asciiCJK`, `array`⁵, `jsonPathValues`⁴ | yes⁴⁵ |
@@ -566,6 +566,8 @@ The latter is instead evaluated by a dictionary scan (`use_text_index_like_evalu
 See [LIKE/ILIKE queries](#like-ilike-queries-perf).
 
 ⁵ The *compatible tokenizers* column ignores the [`keyValuePairs`](#tokenizer-key-value-pairs) tokenizer, which is a specialized tokenizer for `Map` columns.
+
+⁶ With the `jsonPathValues` tokenizer, `IN` uses the index only for a subcolumn of type `String` or `FixedString` (including their `Nullable` and `LowCardinality` variants) and a set of non-empty, non-`NULL` strings of the same type. `IN` on numeric paths and untyped `Dynamic` paths reads the source column.
 
 **Experimental: Support phrase search argument (optional)**.
 
@@ -1294,7 +1296,7 @@ Queries on paths that are not included or are skipped read the source `JSON` col
 
 On untyped `Dynamic` paths, pattern predicates also require `dynamic_throw_on_type_mismatch = 0` to use the index. With the default value of `true`, these predicates read the source column instead.
 
-The index supports equality, `IN` on String subcolumns, `has` on array subcolumns, `startsWith`, `endsWith`, prefix `LIKE` patterns such as `LIKE 'error%'`, simple substring `LIKE` and `ILIKE` predicates, `match`, `multiSearchAny`, and `multiSearchAnyUTF8`. Elements of concrete arrays are indexed individually on both declared and dynamic paths. Use an explicit array type when querying a dynamic path, for example `has(data.tags.:\`Array(Nullable(String))\`, 'bug')`. Declared paths of type `JSON` are traversed recursively: their leaf paths are indexed, but the whole subdocument is not. Scalar leaves below one level of `Array(JSON)` are also indexed as array elements, so predicates such as `has(data.items[].price, 10)` can use the index. Null leaves, nested arrays, maps, and tuples below `Array(JSON)` are not indexed. Whole-array equality, whole-`JSON`-subdocument equality, and casts such as `CAST(data.tags AS Array(String))` are not optimized.
+The index supports equality, `IN` on String subcolumns, `has` on array subcolumns, `startsWith`, `endsWith`, prefix `LIKE` patterns such as `LIKE 'error%'`, simple substring `LIKE` and `ILIKE` predicates, `match`, `multiSearchAny`, and `multiSearchAnyUTF8`. Elements of concrete arrays are indexed individually on both declared and dynamic paths. Use an explicit array type when querying a dynamic path, for example `has(data.tags.:\`Array(Nullable(String))\`, 'bug')`. Declared paths of type `JSON` are traversed through their nested `JSON` and `Array(JSON)` descendants: their leaf paths, including declared typed leaves such as a `Tuple`, are indexed as a whole, but the whole subdocument is not. Paths inside a declared typed path of a non-`JSON` type, such as `data.doc.t.n` for a declared `Tuple` path `doc.t`, do not use the index. Scalar leaves below one level of `Array(JSON)` are also indexed as array elements, so predicates such as `has(data.items[].price, 10)` can use the index. Null leaves, nested arrays, maps, and tuples below `Array(JSON)` are not indexed. Whole-array equality, whole-`JSON`-subdocument equality, and casts such as `CAST(data.tags AS Array(String))` are not optimized.
 
 Declared paths of type `Map(String, String)`, including `LowCardinality(String)` keys or values, are indexed by key and first value. The index accelerates `has`, `mapContains`, and `mapContainsKey` with a constant key, and equality such as `data.attributes['service'] = 'api'` when the compared value is not empty. Missing map keys produce the default empty String, so equality with an empty value is not optimized. Whole-map equality, keyed `IN`, pattern predicates on keyed values, nonconstant keys, dynamic maps, and other map types are not optimized.
 

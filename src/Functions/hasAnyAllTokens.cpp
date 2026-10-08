@@ -418,6 +418,7 @@ Prior to searching, the function tokenizes
 - the `needle` argument (if given as a [String](/reference/data-types/string))
 using the tokenizer specified for the text index.
 If the column has no text index defined, the `splitByNonAlpha` tokenizer is used instead.
+A text index with the [`jsonPathValues`](/reference/engines/table-engines/mergetree-family/textindexes#json-indexes-jsonpathvalues) tokenizer is not used by this function: subcolumns of such a `JSON` column are scanned with the `splitByNonAlpha` tokenizer, and `jsonPathValues` cannot be passed as the tokenizer argument.
 If the `needle` argument is of type [Array(String)](/reference/data-types/array), each array element is treated as a token — no additional tokenization takes place.
 If the text index has a [preprocessor](/reference/engines/table-engines/mergetree-family/textindexes#preprocessor-argument-optional) expression configured, the preprocessor is applied to the needle (if given as a `String`) before tokenization.
 If the text index has a [postprocessor](/reference/engines/table-engines/mergetree-family/textindexes#postprocessor-argument-optional) expression configured, the postprocessor is applied to needle tokens and the input tokens (i.e. both after tokenization).
@@ -640,6 +641,7 @@ Prior to searching, the function tokenizes
 - the `needle` argument (if given as a [String](/reference/data-types/string))
 using the tokenizer specified for the text index.
 If the column has no text index defined, the `splitByNonAlpha` tokenizer is used instead.
+A text index with the [`jsonPathValues`](/reference/engines/table-engines/mergetree-family/textindexes#json-indexes-jsonpathvalues) tokenizer is not used by this function: subcolumns of such a `JSON` column are scanned with the `splitByNonAlpha` tokenizer, and `jsonPathValues` cannot be passed as the tokenizer argument.
 If the `needle` argument is of type [Array(String)](/reference/data-types/array), each array element is treated as a token — no additional tokenization takes place.
 If the text index has a [preprocessor](/reference/engines/table-engines/mergetree-family/textindexes#preprocessor-argument-optional) expression configured, the preprocessor is applied to the needle (if given as a `String`) before tokenization.
 If the text index has a [postprocessor](/reference/engines/table-engines/mergetree-family/textindexes#postprocessor-argument-optional) expression configured, the postprocessor is applied to needle tokens and the input tokens (i.e. both after tokenization).
