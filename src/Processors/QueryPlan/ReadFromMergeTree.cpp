@@ -2725,7 +2725,7 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToRead(bool 
         mutations_snapshot,
         vector_search_parameters,
         top_k_filter_info,
-        storage_snapshot,
+        storage_snapshot->metadata,
         query_info,
         context,
         requested_num_streams,
@@ -2754,7 +2754,7 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::estimateRangesToReadWith
         mutations_snapshot,
         vector_search_parameters,
         top_k_filter_info,
-        storage_snapshot,
+        storage_snapshot->metadata,
         query_info,
         context,
         requested_num_streams,
@@ -2779,7 +2779,7 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToReadForEst
         mutations_snapshot,
         vector_search_parameters,
         top_k_filter_info,
-        storage_snapshot,
+        storage_snapshot->metadata,
         query_info,
         context,
         requested_num_streams,
@@ -3461,7 +3461,7 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
     MergeTreeData::MutationsSnapshotPtr mutations_snapshot,
     const std::optional<VectorSearchParameters> & vector_search_parameters,
     const std::optional<TopKFilterInfo> & top_k_filter_info,
-    const StorageSnapshotPtr & storage_snapshot_,
+    const StorageMetadataPtr & metadata_snapshot,
     const SelectQueryInfo & query_info_,
     ContextPtr context_,
     size_t num_streams,
@@ -3480,7 +3480,6 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
 {
     ProfileEvents::increment(ProfileEvents::IndexAnalysisRounds);
 
-    const auto & metadata_snapshot = storage_snapshot_->metadata;
     AnalysisResult result;
     RangesInDataParts res_parts;
     const auto & settings = context_->getSettingsRef();
@@ -3611,8 +3610,12 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
         bool always_false = FilterTransform::isAlwaysFalseByEmptySet(prewhere_actions, prewhere_column_name);
         if (!always_false)
         {
-            auto header = prewhere_actions.updateHeader(
-                storage_snapshot_->getSampleBlockForColumns(prewhere_actions.getRequiredColumnsNames()));
+            /// Build the header from the DAG inputs: during projection analysis the PREWHERE still refers to
+            /// the parent table columns, which the projection metadata does not have.
+            ColumnsWithTypeAndName inputs;
+            for (const auto & [name, type] : prewhere_actions.getRequiredColumns())
+                inputs.emplace_back(type->createColumn(), type, name);
+            auto header = prewhere_actions.updateHeader(Block(std::move(inputs)));
             const auto & filter_column = header.getByName(prewhere_column_name).column;
             always_false = filter_column && ConstantFilterDescription(*filter_column).always_false;
         }
