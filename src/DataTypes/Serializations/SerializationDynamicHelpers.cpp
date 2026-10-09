@@ -14,6 +14,8 @@
 #include <Columns/ColumnsNumber.h>
 #include <IO/ReadBufferFromMemory.h>
 
+#include <algorithm>
+
 
 namespace DB
 {
@@ -43,14 +45,29 @@ bool areJSONSubcolumnTypesCompatible(const DataTypeObject & lhs, const DataTypeO
     /// `JSON(a UInt64)` or `JSON(a UInt64, b String)`. The opposite direction is not compatible: a
     /// plain `JSON` row is not read as `JSON(a UInt64)`, because parsing its `a` as `UInt64` could
     /// fail (`{"a":"x"}`) or coerce the value (`{"a":"1"}`), while the `Dynamic` element contract is
-    /// that rows of another type read as absent. Skipped paths do not matter for reads: the cast to
-    /// the requested type drops what it skips and keeps what the stored type skipped absent.
+    /// that rows of another type read as absent. The same holds for skipped paths: the cast to the
+    /// requested type drops every path the requested type skips, so a plain `JSON` row read as
+    /// `JSON(SKIP b)` would silently lose `b`. Hence every skip rule of the requested type must also
+    /// be a skip rule of the stored type; the stored type may skip more, those paths are just absent.
     if (for_read)
     {
         for (const auto & [path, requested_path_type] : rhs.getTypedPaths())
         {
             auto it = lhs.getTypedPaths().find(path);
             if (it == lhs.getTypedPaths().end() || !areDynamicSubcolumnTypesCompatibleImpl(*it->second, *requested_path_type, for_read))
+                return false;
+        }
+
+        for (const auto & path : rhs.getPathsToSkip())
+        {
+            if (!lhs.getPathsToSkip().contains(path))
+                return false;
+        }
+
+        const auto & lhs_regexps = lhs.getPathRegexpsToSkip();
+        for (const auto & regexp : rhs.getPathRegexpsToSkip())
+        {
+            if (std::find(lhs_regexps.begin(), lhs_regexps.end(), regexp) == lhs_regexps.end())
                 return false;
         }
 
