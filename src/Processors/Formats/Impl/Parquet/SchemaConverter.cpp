@@ -2031,6 +2031,44 @@ void SchemaConverter::processSubtreeTuple(TraversalNode & node, size_t depth)
     }
 }
 
+namespace
+{
+
+struct RequestedIntegerSpace
+{
+    size_t bits;
+    bool is_signed;
+    /// Converting into `Date`/`Date32`/`DateTime`/`Enum*`/`IPv4`/`Time` clamps or rescales instead of wrapping modulo 2^bits.
+    bool is_native_integer;
+    /// The integer -> date CAST reads a value fitting in 16 bits as a day number, and a wider one as a Unix timestamp.
+    /// The one to `Time` keeps a 16-bit value and clamps a wider one at 999:59:59.
+    bool source_must_fit_in_16_bits;
+};
+
+std::optional<RequestedIntegerSpace> getRequestedIntegerSpace(const IDataType & type)
+{
+    WhichDataType which(type);
+    if (which.isNativeInteger())
+        return RequestedIntegerSpace{type.getSizeOfValueInMemory() * 8, which.isNativeInt(), true, false};
+    if (which.isIPv4() || which.isDateTime())
+        return RequestedIntegerSpace{32, false, false, false};
+    if (which.isEnum8())
+        return RequestedIntegerSpace{8, true, false, false};
+    if (which.isEnum16())
+        return RequestedIntegerSpace{16, true, false, false};
+    if (which.isDate())
+        return RequestedIntegerSpace{16, false, false, true};
+    if (which.isDate32() || which.isTime())
+        return RequestedIntegerSpace{32, true, false, true};
+    /// The integer CAST to an `Interval*` is a plain conversion to its `Int64`.
+    if (which.isInterval())
+        return RequestedIntegerSpace{64, true, true, false};
+    /// No constant of any other type reaches `tryHashInt`'s `Int64`/`UInt64`/`IPv4` `Field` cases.
+    return {};
+}
+
+}
+
 void SchemaConverter::processPrimitiveColumn(
     const parq::SchemaElement & element, DataTypePtr type_hint,
     PageDecoderInfo & out_decoder, DataTypePtr & out_decoded_type,
@@ -2100,7 +2138,7 @@ void SchemaConverter::processPrimitiveColumn(
         if (which.isNativeInteger() || which_is_enum)
         {
             converter.field_signed = which.isNativeInt() || which_is_enum;
-            converter.field_bool = isBool(type_hint ? type_hint : out_inferred_type);
+            converter.output_bool = isBool(type_hint ? type_hint : out_inferred_type);
             if (!stats_order_preserved(converter))
                 return false;
         }
@@ -2139,6 +2177,24 @@ void SchemaConverter::processPrimitiveColumn(
                 return false;
         }
         return true;
+    };
+
+    /// For a 64-bit physical type the decoded width is the physical width, not the declared one.
+    auto allow_int_hash_filters = [&](size_t decoded_bits, bool decoded_signed, size_t physical_bits) -> bool
+    {
+        chassert(out_inferred_type);
+        /// A `Bool` may read any nonzero stored value as `true`, which hashes as 1.
+        if (isBool(type_hint ? type_hint : out_inferred_type))
+            return false;
+        const auto requested = getRequestedIntegerSpace(type_hint ? *type_hint : *out_inferred_type);
+        if (!requested)
+            return false;
+        if (requested->source_must_fit_in_16_bits && decoded_bits > 16)
+            return false;
+        const bool value_preserving = requested->bits >= decoded_bits
+            && (requested->is_signed == decoded_signed || (!decoded_signed && requested->bits > decoded_bits));
+        const bool reinterpretation = requested->is_native_integer && requested->bits >= physical_bits;
+        return value_preserving || reinterpretation;
     };
 
     /// Decides whether min/max stats can be used when convertField produces a DecimalField with
@@ -2234,6 +2290,8 @@ void SchemaConverter::processPrimitiveColumn(
             auto converter = std::make_shared<FixedStringConverter>();
             converter->input_size = size;
             out_decoder.allow_stats = type == parq::Type::FIXED_LEN_BYTE_ARRAY && !element.__isset.converted_type && !element.__isset.logicalType;
+            /// Hashing, unlike min/max, is unaffected by the annotations: both sides hash the raw bytes.
+            out_decoder.allow_hash_filters = type == parq::Type::FIXED_LEN_BYTE_ARRAY;
             out_decoder.fixed_size_converter = std::move(converter);
             return;
         }
@@ -2339,6 +2397,7 @@ void SchemaConverter::processPrimitiveColumn(
             converter->output_size = 2;
 
         out_decoder.allow_stats = dispatch_int_stats_converter(/*allow_datetime_and_ipv4=*/ true, *converter);
+        out_decoder.allow_hash_filters = allow_int_hash_filters(physical_bits == 64 ? 64 : bits, is_signed, physical_bits);
         out_decoder.fixed_size_converter = std::move(converter);
 
         return;
@@ -2706,6 +2765,7 @@ void SchemaConverter::processPrimitiveColumn(
             auto converter = std::make_shared<IntConverter>();
             converter->input_size = 4;
             out_decoder.allow_stats = dispatch_int_stats_converter(/*allow_datetime_and_ipv4=*/ true, *converter);
+            out_decoder.allow_hash_filters = allow_int_hash_filters(32, true, 32);
             out_decoder.fixed_size_converter = std::move(converter);
             return;
         }
@@ -2715,6 +2775,7 @@ void SchemaConverter::processPrimitiveColumn(
             auto converter = std::make_shared<IntConverter>();
             converter->input_size = 8;
             out_decoder.allow_stats = dispatch_int_stats_converter(/*allow_datetime_and_ipv4=*/ false, *converter);
+            out_decoder.allow_hash_filters = allow_int_hash_filters(64, true, 64);
             out_decoder.fixed_size_converter = std::move(converter);
             return;
         }
@@ -2755,6 +2816,8 @@ void SchemaConverter::processPrimitiveColumn(
                 out_decoded_type = std::move(out_inferred_type);
                 out_inferred_type = std::make_shared<DataTypeObject>(DataTypeObject::SchemaFormat::JSON);
             }
+            /// The json block above reassigns the inferred type, so this must be read after it.
+            out_decoder.allow_hash_filters = is_output_type_string();
             return;
         }
         case parq::Type::FIXED_LEN_BYTE_ARRAY:
@@ -2801,6 +2864,9 @@ void SchemaConverter::processPrimitiveColumn(
 
             /// Stats are only allowed for FixedString if the output is actually a string.
             out_decoder.allow_stats = WhichDataType(get_output_type_index()).isString();
+            /// An `IPv6` holds the same 16 bytes as the `FixedString(16)` the array decodes to.
+            out_decoder.allow_hash_filters = WhichDataType(get_output_type_index()).isIPv6()
+                && size_t(element.type_length) == sizeof(IPv6);
             return;
         }
     }
